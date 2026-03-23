@@ -653,6 +653,26 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             # is okay since fragmentation shouldn't exist in the `gpu_buffer_allocator`
             # in layerwise mode.
 
+            # Guard: for hybrid models (e.g. Qwen 3.5), kv_caches may
+            # contain non-tensor entries (mamba state as list-of-tensors).
+            # Filter to tensor-only entries for format detection.
+            if isinstance(kv_caches, list):
+                filtered = [kv for kv in kv_caches
+                            if isinstance(kv, torch.Tensor)]
+                if len(filtered) < len(kv_caches):
+                    logger.info(
+                        "Filtered %d non-tensor KV entries (hybrid model). "
+                        "Using %d attention layers for GPU buffer init.",
+                        len(kv_caches) - len(filtered), len(filtered),
+                    )
+                    kv_caches = filtered
+                if not kv_caches:
+                    logger.warning(
+                        "No tensor-typed KV caches found after filtering. "
+                        "Skipping GPU buffer initialization."
+                    )
+                    return
+
             self.gpu_kv_format = discover_gpu_kv_format(kv_caches, EngineType.VLLM)
             assert_is_vllm_flash_attn_or_flash_infer(self.gpu_kv_format)
             self.tokens_per_layer = get_tokens_per_layer(kv_caches, self.gpu_kv_format)
@@ -1049,6 +1069,26 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             # NOTE (Jiayi): Using the exact number of tokens in the first layer
             # is okay since fragmentation shouldn't exist in the `gpu_buffer_allocator`
             # in layerwise mode.
+
+            # Guard: for hybrid models (e.g. Qwen 3.5), kv_caches may
+            # contain non-tensor entries (mamba state as list-of-tensors).
+            # Filter to tensor-only entries for format detection.
+            if isinstance(kv_caches, list):
+                filtered = [kv for kv in kv_caches
+                            if isinstance(kv, torch.Tensor)]
+                if len(filtered) < len(kv_caches):
+                    logger.info(
+                        "Filtered %d non-tensor KV entries (hybrid model). "
+                        "Using %d attention layers for GPU buffer init.",
+                        len(kv_caches) - len(filtered), len(filtered),
+                    )
+                    kv_caches = filtered
+                if not kv_caches:
+                    logger.warning(
+                        "No tensor-typed KV caches found after filtering. "
+                        "Skipping GPU buffer initialization."
+                    )
+                    return
 
             self.gpu_kv_format = discover_gpu_kv_format(kv_caches, EngineType.VLLM)
             assert_is_vllm_flash_attn_or_flash_infer(self.gpu_kv_format)

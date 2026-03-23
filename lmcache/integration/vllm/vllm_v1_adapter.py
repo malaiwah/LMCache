@@ -706,6 +706,31 @@ class LMCacheConnectorV1Impl:
             )
             kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
 
+            # For hybrid models (e.g. Qwen 3.5), filter to attention-only
+            # layers. Mamba/linear-attention layers have list-of-tensors KV
+            # cache format that LMCache's GPU connector cannot handle.
+            # vLLM only calls save_kv_layer for attention layers anyway
+            # (via the maybe_transfer_kv_layer decorator), so skipping
+            # mamba layers here is safe and correct.
+            attn_kv_caches = {
+                name: kv for name, kv in self.kv_caches.items()
+                if isinstance(kv, torch.Tensor)
+            }
+            skipped = len(self.kv_caches) - len(attn_kv_caches)
+            if skipped > 0:
+                logger.info(
+                    "Hybrid model detected: %d/%d layers are non-attention "
+                    "(mamba/linear-attn) and will be skipped by LMCache. "
+                    "Attention-layer caching remains active.",
+                    skipped, len(self.kv_caches),
+                )
+                self.kv_caches = attn_kv_caches
+                self.num_layers = len(attn_kv_caches)
+                # Also update cache engine's num_layers so it allocates
+                # the correct number of memory objects per chunk.
+                if self.lmcache_engine is not None:
+                    self.lmcache_engine.num_layers = len(attn_kv_caches)
+
     # TODO(chunxiaozheng): in the latest lmcache_connector, we use `register_kv_caches`
     #  to init self.kv_caches, we keep it in order to be compatible with old versions
     #  and will be removed in the future.
