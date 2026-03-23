@@ -1629,14 +1629,32 @@ class LMCacheConnectorV1Impl:
                 # and then set to the number of already cached tokens (maxxing
                 # prefix caching and lmcache)
                 # this assumption is crucial for the update() call of RequestTracker
-                assert request.num_computed_tokens == max(
-                    lmcache_cached_tokens, load_spec.vllm_cached_tokens
-                ), (
-                    f"Preempted request {req_id} has "
-                    f"num_computed_tokens {request.num_computed_tokens} "
-                    "but max(lmcache_cached_tokens, vllm_cached_tokens) = "
-                    f"{max(lmcache_cached_tokens, vllm_cached_tokens)}"
-                )
+                #
+                # When running under MultiConnector, another connector
+                # (e.g. llm-d OffloadingConnector) may have served the
+                # load, so num_computed_tokens can legitimately exceed
+                # what LMCache knows about.  Relax to a >= check and
+                # warn instead of crashing.
+                expected = max(lmcache_cached_tokens, load_spec.vllm_cached_tokens)
+                if request.num_computed_tokens != expected:
+                    if request.num_computed_tokens > expected:
+                        logger.warning(
+                            "Preempted request %s has num_computed_tokens %d > "
+                            "max(lmcache=%d, vllm=%d) = %d; another connector "
+                            "likely served the load.",
+                            req_id,
+                            request.num_computed_tokens,
+                            lmcache_cached_tokens,
+                            load_spec.vllm_cached_tokens,
+                            expected,
+                        )
+                    else:
+                        raise AssertionError(
+                            f"Preempted request {req_id} has "
+                            f"num_computed_tokens {request.num_computed_tokens} "
+                            "but max(lmcache_cached_tokens, vllm_cached_tokens) = "
+                            f"{expected}"
+                        )
 
             # When retrieve fail, vllm will call _handle_invalid_blocks to
             # reset request.num_computed_tokens, this will lead to
