@@ -379,19 +379,13 @@ class ReqMeta:
 
         num_blocks = len(tracker.allocated_block_ids)
 
-        if len(token_ids) > num_blocks * block_size:
-            logger.error(
-                "The number of tokens is more than the number of blocks"
-                " for request %s. "
-                "Something might be wrong in scheduling logic!",
-                tracker.req_id,
-            )
-            logger.error(
-                "Num tokens: %d, num blocks: %d, block size: %d",
-                len(token_ids),
-                num_blocks,
-                block_size,
-            )
+        # For hybrid models (HMA), the attention-group blocks may
+        # cover fewer tokens than the full chunk.  Cap token_ids to
+        # what the allocated blocks can hold — LMCache only caches
+        # attention layers, so this is the correct saveable range.
+        max_saveable_tokens = num_blocks * block_size
+        if len(token_ids) > max_saveable_tokens:
+            token_ids = token_ids[:max_saveable_tokens]
 
         block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
         block_offsets = torch.arange(0, block_size, dtype=torch.long)
