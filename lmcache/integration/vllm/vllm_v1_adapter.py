@@ -170,15 +170,16 @@ class RequestTracker:
         if not isinstance(new_request.block_ids[0], list):
             unfolded_block_ids = new_request.block_ids.copy()
         else:
-            # According to the vLLM code
-            # (https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/
-            # sched/scheduler.py#L943),
-            # only one KVCacheGroup is supported in connector for now.
-
-            # TODO: Please support multiple KVCacheGroup in connector.
-            # NOTE: Also, `update` method in RequestTracker should be
-            # updated accordingly.
-            unfolded_block_ids = new_request.block_ids[0].copy()
+            # For hybrid models (e.g. Qwen3.5 mamba + attention), vLLM
+            # exposes one block list per KV cache group.  The mamba group
+            # always has exactly 1 block (block_size == max_model_len),
+            # while the attention group has one block per attention-block-
+            # size tokens.  Using the mamba block list keeps num_blocks
+            # stuck at 1 and caps max_saveable_tokens at 1 × block_size
+            # regardless of prompt length.  Instead, pick the group with
+            # the most blocks so we track the attention group whose block
+            # count actually grows with the token count.
+            unfolded_block_ids = max(new_request.block_ids, key=len).copy()
 
         # NOTE: Initialized in `update_state_after_alloc`
         disagg_spec = tmp_disagg_tracker.pop(new_request.req_id, None)
@@ -227,7 +228,11 @@ class RequestTracker:
         elif len(new_block_ids) == 0:
             new_block_ids = []
         elif isinstance(new_block_ids, tuple):
-            new_block_ids = new_block_ids[0]
+            # For hybrid models, pick the group with the most new blocks
+            # (attention group).  The mamba group gets 0 new blocks after
+            # the initial allocation, so max-by-len reliably selects the
+            # attention group for all subsequent prefill/decode steps.
+            new_block_ids = max(new_block_ids, key=len)
         elif isinstance(new_block_ids, list):
             # If input is a list, flatten it to handle potential nesting.
             # This also correctly processes already-flat lists.
