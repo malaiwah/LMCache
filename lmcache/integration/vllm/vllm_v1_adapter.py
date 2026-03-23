@@ -357,9 +357,6 @@ class ReqMeta:
         else:
             num_tokens_to_save = input_token_len
 
-        # If we need to save, update the number of saved tokens
-        if not skip_save:
-            tracker.num_saved_tokens = num_tokens_to_save
         save_spec = SaveSpec(skip_leading_tokens, not skip_save)
 
         # Calculate the token ids and slot mappings for load and save
@@ -390,6 +387,15 @@ class ReqMeta:
         )
         if max_saveable_tokens > 0 and len(token_ids) > max_saveable_tokens:
             token_ids = token_ids[:max_saveable_tokens]
+
+        # Update num_saved_tokens AFTER the HMA cap so it reflects
+        # what was actually saved, not what was requested.  The old
+        # placement (before the cap) caused LMCache to believe it had
+        # saved the entire chunk-aligned prompt when only one
+        # attention-block's worth was actually stored, preventing
+        # incremental saves on subsequent prefill steps.
+        if not skip_save:
+            tracker.num_saved_tokens = len(token_ids)
 
         block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
         block_offsets = torch.arange(0, block_size, dtype=torch.long)
