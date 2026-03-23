@@ -658,7 +658,8 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             # Filter to tensor-only entries for format detection.
             if isinstance(kv_caches, list):
                 filtered = [kv for kv in kv_caches
-                            if isinstance(kv, torch.Tensor)]
+                            if isinstance(kv, torch.Tensor)
+                            and kv.dim() in (3, 5)]
                 if len(filtered) < len(kv_caches):
                     logger.info(
                         "Filtered %d non-tensor KV entries (hybrid model). "
@@ -1075,7 +1076,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             # Filter to tensor-only entries for format detection.
             if isinstance(kv_caches, list):
                 filtered = [kv for kv in kv_caches
-                            if isinstance(kv, torch.Tensor)]
+                            if isinstance(kv, torch.Tensor)
+                            and kv.dim() in (3, 5)]
                 if len(filtered) < len(kv_caches):
                     logger.info(
                         "Filtered %d non-tensor KV entries (hybrid model). "

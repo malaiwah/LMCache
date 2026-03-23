@@ -381,10 +381,14 @@ class ReqMeta:
 
         # For hybrid models (HMA), the attention-group blocks may
         # cover fewer tokens than the full chunk.  Cap token_ids to
-        # what the allocated blocks can hold — LMCache only caches
-        # attention layers, so this is the correct saveable range.
+        # what the allocated blocks can hold, aligned down to the
+        # LMCache chunk boundary so the token database gets exact
+        # multiples.
         max_saveable_tokens = num_blocks * block_size
-        if len(token_ids) > max_saveable_tokens:
+        max_saveable_tokens = (
+            max_saveable_tokens // lmcache_chunk_size * lmcache_chunk_size
+        )
+        if max_saveable_tokens > 0 and len(token_ids) > max_saveable_tokens:
             token_ids = token_ids[:max_saveable_tokens]
 
         block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
@@ -695,20 +699,22 @@ class LMCacheConnectorV1Impl:
         # Build KV layer groups structure if not already built
         if self.lmcache_engine is not None:
             assert len(self.kv_caches) > 0
-            kv_layer_groups_manager = (
-                self.lmcache_engine.metadata.kv_layer_groups_manager
-            )
-            kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
 
             # For hybrid models (e.g. Qwen 3.5), filter to attention-only
-            # layers. Mamba/linear-attention layers have list-of-tensors KV
-            # cache format that LMCache's GPU connector cannot handle.
+            # layers BEFORE building groups.  Mamba/linear-attention layers
+            # can be tensors (4D) or list-of-tensors, but LMCache only
+            # handles 5D (MHA) or 3D (MLA) attention KV shapes.
             # vLLM only calls save_kv_layer for attention layers anyway
             # (via the maybe_transfer_kv_layer decorator), so skipping
             # mamba layers here is safe and correct.
+            def _is_attention_kv(kv):
+                if not isinstance(kv, torch.Tensor):
+                    return False
+                return kv.dim() in (3, 5)
+
             attn_kv_caches = {
                 name: kv for name, kv in self.kv_caches.items()
-                if isinstance(kv, torch.Tensor)
+                if _is_attention_kv(kv)
             }
             skipped = len(self.kv_caches) - len(attn_kv_caches)
             if skipped > 0:
@@ -720,10 +726,36 @@ class LMCacheConnectorV1Impl:
                 )
                 self.kv_caches = attn_kv_caches
                 self.num_layers = len(attn_kv_caches)
-                # Also update cache engine's num_layers so it allocates
-                # the correct number of memory objects per chunk.
                 if self.lmcache_engine is not None:
-                    self.lmcache_engine.num_layers = len(attn_kv_caches)
+                    n_attn = len(attn_kv_caches)
+                    self.lmcache_engine.num_layers = n_attn
+                    # Update kv_shape to reflect filtered layer count
+                    old_shape = self.lmcache_engine.metadata.kv_shape
+                    self.lmcache_engine.metadata.kv_shape = (
+                        n_attn,
+                    ) + old_shape[1:]
+                    # Reset GPU connector state — it was created with
+                    # the unfiltered layer count.  Clear all pre-allocated
+                    # buffers so they get lazily re-created at the
+                    # correct size on first use.
+                    gc = self.lmcache_engine.gpu_connector
+                    if gc is not None and hasattr(gc, 'num_layers'):
+                        gc.num_layers = n_attn
+                        gc.kv_cache_pointers = torch.empty(
+                            n_attn, dtype=torch.int64, device="cpu"
+                        )
+                        gc.kv_cache_pointers_on_gpu = {}
+                        # Clear gpu_buffer so it re-allocates with
+                        # the correct layer dimension.
+                        if hasattr(gc, 'gpu_buffer'):
+                            gc.gpu_buffer = None
+                        if hasattr(gc, 'gpu_buffer_allocator'):
+                            gc.gpu_buffer_allocator = None
+
+            kv_layer_groups_manager = (
+                self.lmcache_engine.metadata.kv_layer_groups_manager
+            )
+            kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
 
     # TODO(chunxiaozheng): in the latest lmcache_connector, we use `register_kv_caches`
     #  to init self.kv_caches, we keep it in order to be compatible with old versions
