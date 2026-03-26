@@ -547,6 +547,7 @@ class LMCacheConnectorV1Impl:
         self._check_legacy_register_kv_caches()
 
         self.kv_caches: dict[str, torch.Tensor] = {}
+        self._has_non_attention_layers = False
         self._block_size = vllm_config.cache_config.block_size
         self.load_specs: dict[str, LoadSpec] = {}
         self.kv_cache_manager: Optional["KVCacheManager"] = None
@@ -729,10 +730,12 @@ class LMCacheConnectorV1Impl:
             }
             skipped = len(self.kv_caches) - len(attn_kv_caches)
             if skipped > 0:
+                self._has_non_attention_layers = True
                 logger.info(
-                    "Hybrid model detected: %d/%d layers are non-attention "
-                    "(mamba/linear-attn) and will be skipped by LMCache. "
-                    "Attention-layer caching remains active.",
+                    "Hybrid model: %d/%d layers are "
+                    "non-attention (mamba/recurrent). Cache "
+                    "load disabled — attention-only KV leaves "
+                    "mamba state uninitialized.",
                     skipped, len(self.kv_caches),
                 )
                 self.kv_caches = attn_kv_caches
@@ -1286,6 +1289,10 @@ class LMCacheConnectorV1Impl:
         """
         # Ignore DP attention mock requests
         if request.request_id.startswith("mock_req"):
+            return 0
+        # Hybrid models: can't claim hits when mamba state
+        # would be left uninitialized.
+        if self._has_non_attention_layers:
             return 0
         # to handle preempted requests, we want `get_num_new_matched_tokens` to be
         # idempotent under the condition that `update_state_after_alloc` is NOT called
