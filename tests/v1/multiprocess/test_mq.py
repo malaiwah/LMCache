@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from multiprocessing.synchronize import Event as EventClass
+from types import SimpleNamespace
 from typing import Any, Callable
+from unittest.mock import MagicMock
 import multiprocessing as mp
 import sys
+import queue
+import threading
 import time
 
 # Third Party
@@ -19,6 +23,7 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.mq import (
     BlockingRequestHandler,
+    ClientPollingLoop,
     MessageQueueClient,
     MessageQueueServer,
     RemoteHandlerError,
@@ -30,6 +35,7 @@ from lmcache.v1.multiprocess.protocol import (
 )
 from lmcache.v1.multiprocess.server import add_handler_helper
 from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
+import lmcache.v1.multiprocess.mq as mq_mod
 
 # Test helpers
 from tests.v1.multiprocess import test_mq_handler_helpers
@@ -682,6 +688,159 @@ def test_shared_loop_dispatch():
         assert ClientPollingLoop._instance is None
     finally:
         server.close()
+
+
+def test_full_dead_client_queue_does_not_block_healthy_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A muted DEALER fails locally without wedging the singleton loop."""
+    monkeypatch.setattr(mq_mod, "_CLIENT_SNDHWM", 1)
+    context = zmq.Context.instance()
+    server = MessageQueueServer("tcp://127.0.0.1:16023", context)
+    add_handler_helper(server, RequestType.NOOP, test_mq_handler_helpers.noop_handler)
+    server.start()
+
+    dead_client = MessageQueueClient("tcp://127.0.0.1:16024", context)
+    healthy_client = MessageQueueClient("tcp://127.0.0.1:16023", context)
+    try:
+        dead_futures = [
+            dead_client.submit_request(RequestType.NOOP, []) for _ in range(32)
+        ]
+
+        # The healthy client's request shares the same loop and must still
+        # leave the process and receive its response.
+        assert (
+            healthy_client.submit_request(RequestType.NOOP, []).result(timeout=2)
+            == "NOOP_OK"
+        )
+
+        deadline = time.monotonic() + 2
+        while not any(future.query() for future in dead_futures):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        completed = [future for future in dead_futures if future.query()]
+        assert completed
+        with pytest.raises(RuntimeError, match="send queue is full"):
+            completed[0].result()
+    finally:
+        dead_client.close()
+        healthy_client.close()
+        server.close()
+
+
+def test_timed_out_unregister_is_retired_when_loop_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred unregister keeps the socket alive until poller removal."""
+    monkeypatch.setattr(mq_mod, "_CLIENT_CONTROL_TIMEOUT_S", 0.01)
+    loop = ClientPollingLoop.__new__(ClientPollingLoop)
+    loop._ops_queue = queue.Queue()
+    loop._notifier = MagicMock()
+    loop._poller = MagicMock()
+    client = MagicMock()
+    loop._socket_to_client = {client.socket: client}
+
+    started = time.monotonic()
+    assert loop.unregister(client) is False
+    assert time.monotonic() - started < 0.5
+
+    # When the loop recovers, it removes the socket before closing it.
+    loop._process_ops()
+    loop._poller.unregister.assert_called_once_with(client.socket)
+    client._close_socket.assert_called_once_with()
+    assert loop._socket_to_client == {}
+
+
+def test_claimed_register_timeout_rolls_back_on_polling_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A claimed REGISTER cannot outlive and re-register a failed client."""
+    monkeypatch.setattr(mq_mod, "_CLIENT_CONTROL_TIMEOUT_S", 0.1)
+    loop = ClientPollingLoop.__new__(ClientPollingLoop)
+    loop._ops_queue = queue.Queue()
+    loop._notifier = MagicMock()
+    loop._poller = MagicMock()
+    loop._socket_to_client = {}
+    client = MagicMock()
+    register_claimed = threading.Event()
+    release_register = threading.Event()
+
+    def _delayed_register(*_args) -> None:
+        register_claimed.set()
+        assert release_register.wait(timeout=1)
+
+    loop._poller.register.side_effect = _delayed_register
+
+    errors: list[BaseException] = []
+
+    def _register() -> None:
+        try:
+            loop.register(client)
+        except BaseException as exc:
+            errors.append(exc)
+
+    caller = threading.Thread(target=_register, daemon=True)
+    caller.start()
+    deadline = time.monotonic() + 1
+    while loop._ops_queue.empty():
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+
+    worker = threading.Thread(target=loop._process_ops, daemon=True)
+    worker.start()
+    assert register_claimed.wait(timeout=1)
+    caller.join(timeout=1)
+    assert len(errors) == 1
+    assert isinstance(errors[0], TimeoutError)
+    client._close_socket.assert_not_called()
+
+    release_register.set()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    loop._poller.unregister.assert_called_once_with(client.socket)
+    client._close_socket.assert_called_once_with()
+    assert loop._socket_to_client == {}
+
+
+def test_release_instance_uses_bounded_join_and_preserves_live_notifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown returns even if the loop is stuck for an unrelated reason."""
+    monkeypatch.setattr(mq_mod, "_CLIENT_THREAD_JOIN_TIMEOUT_S", 0.01)
+    thread = MagicMock()
+    thread.is_alive.return_value = True
+    notifier = MagicMock()
+    loop = SimpleNamespace(
+        _ref_count=1,
+        _is_finished=MagicMock(),
+        _notifier=notifier,
+        _thread=thread,
+    )
+    ClientPollingLoop._instance = loop
+    try:
+        ClientPollingLoop.release_instance()
+    finally:
+        ClientPollingLoop._instance = None
+
+    thread.join.assert_called_once_with(timeout=0.01)
+    notifier.close.assert_not_called()
+
+
+def test_client_close_defers_socket_close_after_unregister_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client._closed = False
+    client._polling_loop = MagicMock()
+    client._polling_loop.unregister.return_value = False
+    client.socket = MagicMock()
+    release = MagicMock()
+    monkeypatch.setattr(ClientPollingLoop, "release_instance", release)
+
+    client.close()
+
+    release.assert_called_once_with()
+    client.socket.close.assert_not_called()
 
 
 def test_sync_handler_failure_completes_future_and_loop_recovers():

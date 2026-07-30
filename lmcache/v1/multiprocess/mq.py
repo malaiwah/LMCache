@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
+from dataclasses import dataclass, field
 from typing import Any, Callable, Generic, Optional, TypeVar, get_type_hints
 import enum
 import inspect
@@ -42,6 +46,9 @@ RequestUID = int
 
 _ERROR_RESPONSE_MARKER = b"LMCACHE_RPC_ERROR_V1"
 _MAX_REMOTE_ERROR_MESSAGE_BYTES = 4096
+_CLIENT_SNDHWM = 1000
+_CLIENT_CONTROL_TIMEOUT_S = 5.0
+_CLIENT_THREAD_JOIN_TIMEOUT_S = 5.0
 
 
 class RemoteHandlerError(RuntimeError):
@@ -137,7 +144,9 @@ class _OpKind(enum.Enum):
 class _PollOp:
     kind: _OpKind
     client: "MessageQueueClient"
-    done: threading.Event
+    completion: Future[None]
+    abandoned: bool = False
+    state_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class ClientPollingLoop:
@@ -195,84 +204,143 @@ class ClientPollingLoop:
             inst._notifier.notify()
             cls._instance = None
 
-        inst._thread.join()
-        inst._notifier.close()
-        logger.debug("ClientPollingLoop shut down")
+        inst._thread.join(timeout=_CLIENT_THREAD_JOIN_TIMEOUT_S)
+        if inst._thread.is_alive():
+            # The notifier must outlive a thread that may still resume and use
+            # it. The polling thread closes its notifier when it eventually
+            # exits.
+            logger.error(
+                "ClientPollingLoop did not stop within %.1fs; "
+                "deferring notifier close to polling thread",
+                _CLIENT_THREAD_JOIN_TIMEOUT_S,
+            )
+            return
+
+    def _queue_op(
+        self, kind: _OpKind, client: "MessageQueueClient"
+    ) -> tuple[bool, bool]:
+        completion: Future[None] = Future()
+        op = _PollOp(kind=kind, client=client, completion=completion)
+        self._ops_queue.put(op)
+        self._notifier.notify()
+        try:
+            completion.result(timeout=_CLIENT_CONTROL_TIMEOUT_S)
+        except FutureTimeoutError:
+            with op.state_lock:
+                # Resolve the deadline race with _process_ops. If it completed
+                # while result() raised, consume that result as normal.
+                if completion.done():
+                    completion.result()
+                    return True, False
+                op.abandoned = True
+                # An unclaimed REGISTER can be cancelled and closed by its
+                # constructor. UNREGISTER must remain queued so the polling
+                # thread eventually removes the socket before closing it.
+                cancelled = completion.cancel() if kind is _OpKind.REGISTER else False
+            logger.error(
+                "Timed out after %.1fs waiting to %s MessageQueueClient",
+                _CLIENT_CONTROL_TIMEOUT_S,
+                kind.value,
+            )
+            return False, cancelled
+        return True, False
 
     def register(self, client: "MessageQueueClient") -> None:
-        """Register a client's DEALER socket with the shared poller.
+        """Register a client without allowing construction to hang forever."""
+        completed, cancelled = self._queue_op(_OpKind.REGISTER, client)
+        if not completed:
+            if cancelled:
+                client._close_socket()
+            raise TimeoutError("Timed out registering MessageQueueClient")
 
-        Blocks until the loop thread has completed the registration.
-
-        Args:
-            client: The MessageQueueClient to register.
-        """
-        done = threading.Event()
-        self._ops_queue.put(_PollOp(kind=_OpKind.REGISTER, client=client, done=done))
-        self._notifier.notify()
-        done.wait()
-
-    def unregister(self, client: "MessageQueueClient") -> None:
-        """Unregister a client's DEALER socket from the shared poller.
-
-        Blocks until the loop thread has completed the unregistration.
-
-        Args:
-            client: The MessageQueueClient to unregister.
-        """
-        done = threading.Event()
-        self._ops_queue.put(_PollOp(kind=_OpKind.UNREGISTER, client=client, done=done))
-        self._notifier.notify()
-        done.wait()
+    def unregister(self, client: "MessageQueueClient") -> bool:
+        """Unregister a client, returning false rather than hanging shutdown."""
+        completed, _cancelled = self._queue_op(_OpKind.UNREGISTER, client)
+        return completed
 
     def notify(self) -> None:
         """Wake the polling loop to process outbound tasks."""
         self._notifier.notify()
 
-    def _process_ops(self) -> None:
-        """Drain the ops queue and apply register/unregister to the poller."""
+    def _retire_client(self, client: "MessageQueueClient") -> None:
+        """Remove a client from this poller before closing its socket."""
         try:
-            while True:
+            if client.socket in self._socket_to_client:
+                self._poller.unregister(client.socket)
+        finally:
+            self._socket_to_client.pop(client.socket, None)
+            client._close_socket()
+
+    def _process_ops(self) -> None:
+        """Drain queued control operations and wake every waiting caller."""
+        while True:
+            try:
                 op = self._ops_queue.get_nowait()
+            except queue.Empty:
+                return
+            if not op.completion.set_running_or_notify_cancel():
+                continue
+            try:
                 if op.kind is _OpKind.REGISTER:
-                    self._poller.register(op.client.socket, zmq.POLLIN)
-                    self._socket_to_client[op.client.socket] = op.client
-                    logger.debug("Registered client socket %s", op.client.socket)
+                    with op.state_lock:
+                        abandoned = op.abandoned
+                    if not abandoned:
+                        self._poller.register(op.client.socket, zmq.POLLIN)
+                        self._socket_to_client[op.client.socket] = op.client
+                        logger.debug("Registered client socket %s", op.client.socket)
+                    with op.state_lock:
+                        if op.abandoned:
+                            self._retire_client(op.client)
+                        op.completion.set_result(None)
                 elif op.kind is _OpKind.UNREGISTER:
-                    self._poller.unregister(op.client.socket)
-                    self._socket_to_client.pop(op.client.socket, None)
+                    self._retire_client(op.client)
+                    with op.state_lock:
+                        op.completion.set_result(None)
                     logger.debug("Unregistered client socket %s", op.client.socket)
-                op.done.set()
-        except queue.Empty:
-            pass
+            except Exception as exc:
+                op.client._close_socket()
+                with op.state_lock:
+                    op.completion.set_exception(exc)
 
     def _main_loop(self) -> None:
         """Unified poll loop for all registered clients."""
         notifier_fd = self._notifier.fileno()
 
-        while not self._is_finished.is_set():
+        try:
+            while not self._is_finished.is_set():
+                self._process_ops()
+
+                socks = dict(self._poller.poll(1000))
+
+                # Outbound: shared notifier woke us — drain it, then flush
+                # all clients' output queues.
+                if socks.get(notifier_fd) and socks[notifier_fd] & zmq.POLLIN:
+                    self._notifier.consume()
+                    for client in self._socket_to_client.values():
+                        try:
+                            client.process_outbound_task()
+                        except Exception:
+                            # One bad socket/client must not kill the singleton loop
+                            # and strand every other client's futures/control ops.
+                            logger.exception("Unhandled outbound client error")
+
+                # Inbound: dispatch each ready DEALER socket to its client.
+                for sock, event in socks.items():
+                    if sock is notifier_fd:
+                        continue
+                    if event & zmq.POLLIN:
+                        owner = self._socket_to_client.get(sock)
+                        if owner is not None:
+                            try:
+                                owner.process_inbound()
+                            except Exception:
+                                logger.exception("Unhandled inbound client error")
+        finally:
+            # Drain remaining ops so waiting threads unblock, then close the
+            # notifier here so even a delayed thread exit releases it safely.
             self._process_ops()
-
-            socks = dict(self._poller.poll(1000))
-
-            # Outbound: shared notifier woke us — drain it, then flush
-            # all clients' output queues.
-            if socks.get(notifier_fd) and socks[notifier_fd] & zmq.POLLIN:
-                self._notifier.consume()
-                for client in self._socket_to_client.values():
-                    client.process_outbound_task()
-
-            # Inbound: dispatch each ready DEALER socket to its client.
-            for sock, event in socks.items():
-                if sock is notifier_fd:
-                    continue
-                if event & zmq.POLLIN:
-                    owner = self._socket_to_client.get(sock)
-                    if owner is not None:
-                        owner.process_inbound()
-
-        # Drain remaining ops so any waiting threads unblock.
-        self._process_ops()
+            self._notifier.close()
+            logger.debug("ClientPollingLoop shut down")
 
 
 # Main classes
@@ -285,9 +353,10 @@ class MessageQueueClient:
         request_payloads: list[Any]
 
     def __init__(self, server_url: str, context: zmq.Context):
-        # Socket
         self.ctx = context
         self.socket = self.ctx.socket(zmq.DEALER)
+        self.socket.setsockopt(zmq.SNDHWM, _CLIENT_SNDHWM)
+        self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.connect(server_url)
 
         # Input queue
@@ -296,21 +365,27 @@ class MessageQueueClient:
         # Pending job's futures
         self._request_counter = itertools.count()
         self.pending_futures: dict[int, MessagingFuture[Any]] = {}
+        self._closed = False
+        self._socket_closed = False
+        self._socket_close_lock = threading.Lock()
 
-        # Register with the shared polling loop
+        # Register with the shared polling loop.
         self._polling_loop = ClientPollingLoop.get_instance()
-        self._polling_loop.register(self)
-
-    def process_outbound_task(self):
         try:
-            while wrapped_request := self.input_queue.get_nowait():
-                # wrapped_request = self.input_queue.get_nowait()
+            self._polling_loop.register(self)
+        except Exception:
+            ClientPollingLoop.release_instance()
+            raise
 
-                # Update the pending futures
-                request_uid = wrapped_request.request_uid
-                self.pending_futures[request_uid] = wrapped_request.future
+    def process_outbound_task(self) -> None:
+        while True:
+            try:
+                wrapped_request = self.input_queue.get_nowait()
+            except queue.Empty:
+                return
 
-                # Send the request
+            request_uid = wrapped_request.request_uid
+            try:
                 b_request_uid = msgspec_encode(request_uid, cls=RequestUID)
                 b_request_type = msgspec_encode(
                     wrapped_request.request_type, cls=RequestType
@@ -322,7 +397,7 @@ class MessageQueueClient:
                         type(p).__name__ for p in wrapped_request.request_payloads
                     ]
                     raise ValueError(
-                        f"Payload count mismatch for request "
+                        f"Payload count mismatch for "
                         f"{wrapped_request.request_type}: "
                         f"expected {len(payload_classes)} payloads "
                         f"{expected_classes}, "
@@ -340,9 +415,27 @@ class MessageQueueClient:
                         strict=False,
                     )
                 ]
-                self.socket.send_multipart([b_request_uid, b_request_type] + b_payloads)
-        except queue.Empty:
-            pass
+                # Register immediately before the atomic nonblocking send so a
+                # fast response cannot race pending-future publication.
+                self.pending_futures[request_uid] = wrapped_request.future
+                self.socket.send_multipart(
+                    [b_request_uid, b_request_type] + b_payloads,
+                    flags=zmq.NOBLOCK,
+                )
+            except zmq.Again:
+                self.pending_futures.pop(request_uid, None)
+                wrapped_request.future.set_exception(
+                    RuntimeError("LMCache MQ send queue is full; server is unreachable")
+                )
+                logger.error(
+                    "Nonblocking LMCache MQ send failed for request_uid=%d: "
+                    "send queue full",
+                    request_uid,
+                )
+            except Exception as exc:
+                self.pending_futures.pop(request_uid, None)
+                wrapped_request.future.set_exception(exc)
+                logger.exception("Cannot send LMCache MQ request_uid=%d", request_uid)
 
     def process_inbound(self) -> None:
         """Process one inbound response from the server.
@@ -423,10 +516,27 @@ class MessageQueueClient:
         self._polling_loop.notify()
         return future
 
+    def _close_socket(self) -> None:
+        """Close only after this socket is absent from the shared poller."""
+        with self._socket_close_lock:
+            if self._socket_closed:
+                return
+            self._socket_closed = True
+            self.socket.close(linger=0)
+
     def close(self) -> None:
-        self._polling_loop.unregister(self)
-        ClientPollingLoop.release_instance()
-        self.socket.close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._polling_loop.unregister(self)
+        except Exception:
+            logger.exception("Failed to unregister MessageQueueClient")
+        finally:
+            # unregister() owns socket retirement, even after a timeout. This
+            # caller may return while the live polling thread still references
+            # the client, so it must not close the socket itself.
+            ClientPollingLoop.release_instance()
 
 
 ResponseType = TypeVar("ResponseType", covariant=True)
