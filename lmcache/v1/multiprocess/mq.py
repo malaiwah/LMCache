@@ -138,6 +138,7 @@ def msgspec_decode(b_obj: bytes, cls: Any) -> Any:
 class _OpKind(enum.Enum):
     REGISTER = "register"
     UNREGISTER = "unregister"
+    RESET = "reset"
 
 
 @dataclass
@@ -234,8 +235,9 @@ class ClientPollingLoop:
                     return True, False
                 op.abandoned = True
                 # An unclaimed REGISTER can be cancelled and closed by its
-                # constructor. UNREGISTER must remain queued so the polling
-                # thread eventually removes the socket before closing it.
+                # constructor. UNREGISTER and RESET must remain queued so the
+                # polling thread eventually stops using the old socket before
+                # it is closed with zero linger.
                 cancelled = completion.cancel() if kind is _OpKind.REGISTER else False
             logger.error(
                 "Timed out after %.1fs waiting to %s MessageQueueClient",
@@ -258,6 +260,11 @@ class ClientPollingLoop:
         completed, _cancelled = self._queue_op(_OpKind.UNREGISTER, client)
         return completed
 
+    def reset(self, client: "MessageQueueClient") -> bool:
+        """Replace one client's socket without blocking the shared loop."""
+        completed, _cancelled = self._queue_op(_OpKind.RESET, client)
+        return completed
+
     def notify(self) -> None:
         """Wake the polling loop to process outbound tasks."""
         self._notifier.notify()
@@ -269,7 +276,24 @@ class ClientPollingLoop:
                 self._poller.unregister(client.socket)
         finally:
             self._socket_to_client.pop(client.socket, None)
+            client._fail_outstanding("LMCache MQ client closed")
             client._close_socket()
+
+    def _reset_client(self, client: "MessageQueueClient") -> None:
+        """Discard one transport session and register a fresh DEALER socket."""
+        old_socket = client.socket
+        try:
+            if old_socket in self._socket_to_client:
+                self._poller.unregister(old_socket)
+        finally:
+            self._socket_to_client.pop(old_socket, None)
+
+        client._fail_outstanding(
+            "LMCache MQ request abandoned after server became unhealthy"
+        )
+        client._replace_socket()
+        self._poller.register(client.socket, zmq.POLLIN)
+        self._socket_to_client[client.socket] = client
 
     def _process_ops(self) -> None:
         """Drain queued control operations and wake every waiting caller."""
@@ -297,6 +321,11 @@ class ClientPollingLoop:
                     with op.state_lock:
                         op.completion.set_result(None)
                     logger.debug("Unregistered client socket %s", op.client.socket)
+                elif op.kind is _OpKind.RESET:
+                    self._reset_client(op.client)
+                    with op.state_lock:
+                        op.completion.set_result(None)
+                    logger.debug("Reset client socket %s", op.client.socket)
             except Exception as exc:
                 op.client._close_socket()
                 with op.state_lock:
@@ -316,6 +345,9 @@ class ClientPollingLoop:
                 # all clients' output queues.
                 if socks.get(notifier_fd) and socks[notifier_fd] & zmq.POLLIN:
                     self._notifier.consume()
+                    # Operations queued while poll() slept (especially RESET)
+                    # must take effect before any old-session outbound work.
+                    self._process_ops()
                     for client in self._socket_to_client.values():
                         try:
                             client.process_outbound_task()
@@ -354,10 +386,8 @@ class MessageQueueClient:
 
     def __init__(self, server_url: str, context: zmq.Context):
         self.ctx = context
-        self.socket = self.ctx.socket(zmq.DEALER)
-        self.socket.setsockopt(zmq.SNDHWM, _CLIENT_SNDHWM)
-        self.socket.setsockopt(zmq.LINGER, 0)
-        self.socket.connect(server_url)
+        self.server_url = server_url
+        self.socket = self._create_socket()
 
         # Input queue
         self.input_queue: queue.Queue = queue.Queue()
@@ -378,11 +408,21 @@ class MessageQueueClient:
             raise
 
     def process_outbound_task(self) -> None:
+        # A timed-out future is terminal. Reclaim it only here, on the polling
+        # thread, so a late response cannot race a caller-side dict mutation.
+        for request_uid, future in list(self.pending_futures.items()):
+            if future.query():
+                self.pending_futures.pop(request_uid, None)
+
         while True:
             try:
                 wrapped_request = self.input_queue.get_nowait()
             except queue.Empty:
                 return
+            if wrapped_request.future.query():
+                # The caller's deadline elapsed before this request left the
+                # lifecycle-aware input queue.
+                continue
 
             request_uid = wrapped_request.request_uid
             try:
@@ -503,8 +543,10 @@ class MessageQueueClient:
         Returns:
             MessagingFuture[T]: A future that will hold the response.
         """
-        future: MessagingFuture[T] = MessagingFuture()
         request_uid = next(self._request_counter)
+        future: MessagingFuture[T] = MessagingFuture(
+            on_timeout=self._polling_loop.notify
+        )
         self.input_queue.put(
             MessageQueueClient.WrappedRequest(
                 request_uid=request_uid,
@@ -515,6 +557,47 @@ class MessageQueueClient:
         )
         self._polling_loop.notify()
         return future
+
+    def reset_connection(self) -> bool:
+        """Discard queued work after a server outage and reconnect.
+
+        The reset runs on the shared polling thread. Closing the old DEALER
+        with zero linger disposes requests buffered by ZeroMQ, while a fresh
+        socket identity prevents late responses from matching new work.
+
+        Returns:
+            bool: True when the reset completed within the control timeout.
+        """
+        if self._closed:
+            return False
+        return self._polling_loop.reset(self)
+
+    def _create_socket(self) -> zmq.Socket:
+        """Create a configured DEALER for the current server URL."""
+        socket = self.ctx.socket(zmq.DEALER)
+        socket.setsockopt(zmq.SNDHWM, _CLIENT_SNDHWM)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.connect(self.server_url)
+        return socket
+
+    def _fail_outstanding(self, message: str) -> None:
+        """Fail pending and not-yet-sent work on the polling thread."""
+        futures = list(self.pending_futures.values())
+        self.pending_futures.clear()
+        while True:
+            try:
+                futures.append(self.input_queue.get_nowait().future)
+            except queue.Empty:
+                break
+        for future in futures:
+            future.set_exception(ConnectionError(message))
+
+    def _replace_socket(self) -> None:
+        """Close the unregistered socket and install a fresh one."""
+        with self._socket_close_lock:
+            self.socket.close(linger=0)
+            self.socket = self._create_socket()
+            self._socket_closed = False
 
     def _close_socket(self) -> None:
         """Close only after this socket is absent from the shared poller."""

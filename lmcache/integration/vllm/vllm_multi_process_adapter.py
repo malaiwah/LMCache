@@ -525,6 +525,21 @@ class HeartbeatThread(PeriodicThread):
                 message="stop requested; skipping health update",
             )
 
+        if not healthy:
+            # Gate worker/scheduler callers before failing old futures so they
+            # take their established degraded-mode cleanup path.
+            self._health_event.clear()
+            # Retire the old ZeroMQ transport session before any later
+            # heartbeat can mark the adapter healthy again. This discards
+            # buffered STORE/RETRIEVE work whose GPU block IDs belong to the
+            # request lifecycle that just entered degraded mode.
+            try:
+                self._mq_client.reset_connection()
+            except Exception:
+                logger.exception(
+                    "Failed to reset LMCache MQ connection after heartbeat failure"
+                )
+
         need_trigger_recover = (
             healthy and not was_healthy and self._recover_callback is not None
         )
@@ -726,13 +741,15 @@ class LMCacheMPSchedulerAdapter:
         return all(ev.is_set() for ev in self._health_events.values())
 
     def _ensure_heartbeat_started(self) -> None:
-        """Lazily start the heartbeat thread on first use."""
-        if self._heartbeats is not None:
+        """Lazily start one heartbeat thread per server on first use."""
+        if len(self._heartbeats) == len(self.mq_clients):
             return
         with self._heartbeat_lock:
-            if self._heartbeats is not None:
+            if len(self._heartbeats) == len(self.mq_clients):
                 return
             for url, client in self.mq_clients.items():
+                if url in self._heartbeats:
+                    continue
                 hb = HeartbeatThread(
                     mq_client=client,
                     health_event=self._health_events[url],
@@ -956,11 +973,11 @@ class LMCacheMPSchedulerAdapter:
 
     def shutdown(self) -> None:
         """Shutdown the scheduler adapter and its resources."""
-        for client in self.mq_clients.values():
-            client.close()
         with self._heartbeat_lock:
             for hb in self._heartbeats.values():
                 hb.stop()
+        for client in self.mq_clients.values():
+            client.close()
 
     def free_lookup_locks(
         self,

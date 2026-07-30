@@ -20,6 +20,7 @@ import torch
 from lmcache.integration.vllm import vllm_multi_process_adapter as adapter_mod
 from lmcache.integration.vllm.vllm_multi_process_adapter import (
     HeartbeatThread,
+    LMCacheMPSchedulerAdapter,
     LMCacheMPWorkerAdapter,
     LoadStoreOp,
     ParallelStrategy,
@@ -482,6 +483,64 @@ def test_heartbeat_lazy_start_wires_callback_before_start(fake_adapter) -> None:
     adapter.submit_store_request("req-2", _op([[1]]), MagicMock())
     assert len(FakeHeartbeatThread.instances) == 1
     assert adapter.transfer_ctx.submit_store.call_count == 2
+
+
+def test_scheduler_heartbeat_starts_from_empty_map_once_per_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scheduler's initially empty heartbeat map is a startable state."""
+    FakeHeartbeatThread.instances.clear()
+    FakeHeartbeatThread.start_hook = lambda _hb: None
+    monkeypatch.setattr(adapter_mod, "HeartbeatThread", FakeHeartbeatThread)
+
+    adapter = LMCacheMPSchedulerAdapter.__new__(LMCacheMPSchedulerAdapter)
+    adapter.mq_clients = {
+        "tcp://server-a:5555": MagicMock(),
+        "tcp://server-b:5555": MagicMock(),
+    }
+    adapter._health_events = {
+        url: threading.Event() for url in adapter.mq_clients
+    }
+    adapter._heartbeat_interval = 5.0
+    adapter._heartbeats = {}
+    adapter._heartbeat_lock = threading.Lock()
+
+    adapter._ensure_heartbeat_started()
+    adapter._ensure_heartbeat_started()
+
+    assert set(adapter._heartbeats) == set(adapter.mq_clients)
+    assert len(FakeHeartbeatThread.instances) == 2
+    assert all(
+        heartbeat.calls == ["start"] for heartbeat in FakeHeartbeatThread.instances
+    )
+
+
+def test_heartbeat_retires_outage_session_then_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient timeout drops stale transport work and a later ping heals."""
+    ping_results = iter([False, True])
+    monkeypatch.setattr(
+        adapter_mod,
+        "send_ping",
+        lambda mq_client, timeout, instance_id=None: next(ping_results),
+    )
+    mq_client = MagicMock()
+    health_event = threading.Event()
+    health_event.set()
+    heartbeat = HeartbeatThread(
+        mq_client=mq_client,
+        health_event=health_event,
+        interval=5.0,
+    )
+
+    heartbeat._execute()
+    assert not health_event.is_set()
+    mq_client.reset_connection.assert_called_once_with()
+
+    heartbeat._execute()
+    assert health_event.is_set()
+    mq_client.reset_connection.assert_called_once_with()
 
 
 def test_heartbeat_first_ping_runs_callback_before_setting_event(

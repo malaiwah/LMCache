@@ -728,6 +728,77 @@ def test_full_dead_client_queue_does_not_block_healthy_client(
         server.close()
 
 
+def test_timed_out_future_is_reclaimed_and_late_response_is_ignored() -> None:
+    """A caller deadline retires its UID; a late reply stays quarantined."""
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.input_queue = queue.Queue()
+    client._request_counter = iter([17])
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    client.socket = MagicMock()
+
+    future = client.submit_request(RequestType.NOOP, [])
+    client.process_outbound_task()
+    assert client.pending_futures == {17: future}
+
+    with pytest.raises(TimeoutError, match="not available within timeout"):
+        future.result(timeout=0)
+    client._polling_loop.notify.assert_called()
+
+    # Reclamation happens on the polling thread, not in result()'s caller.
+    client.process_outbound_task()
+    assert client.pending_futures == {}
+
+    client.socket.recv_multipart.return_value = [
+        mq_mod.msgspec_encode(17, cls=mq_mod.RequestUID),
+        mq_mod.msgspec_encode(RequestType.NOOP, cls=RequestType),
+        mq_mod.msgspec_encode("NOOP_OK", cls=str),
+    ]
+    client.process_inbound()
+    with pytest.raises(TimeoutError, match="not available within timeout"):
+        future.result()
+
+
+def test_connection_reset_discards_stale_pending_and_unsent_work() -> None:
+    """Retiring an outage session fails old work before the fresh socket starts."""
+    loop = ClientPollingLoop.__new__(ClientPollingLoop)
+    loop._poller = MagicMock()
+    old_socket = MagicMock(name="old_socket")
+    new_socket = MagicMock(name="new_socket")
+
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.ctx = MagicMock()
+    client.ctx.socket.return_value = new_socket
+    client.server_url = "tcp://127.0.0.1:16024"
+    client.socket = old_socket
+    client._socket_closed = False
+    client._socket_close_lock = threading.Lock()
+    client.pending_futures = {}
+    client.input_queue = queue.Queue()
+
+    pending = mq_mod.MessagingFuture()
+    unsent = mq_mod.MessagingFuture()
+    client.pending_futures[3] = pending
+    client.input_queue.put(
+        MessageQueueClient.WrappedRequest(4, unsent, RequestType.NOOP, [])
+    )
+    loop._socket_to_client = {old_socket: client}
+
+    loop._reset_client(client)
+
+    with pytest.raises(ConnectionError, match="became unhealthy"):
+        pending.result()
+    with pytest.raises(ConnectionError, match="became unhealthy"):
+        unsent.result()
+    old_socket.close.assert_called_once_with(linger=0)
+    new_socket.setsockopt.assert_any_call(zmq.SNDHWM, mq_mod._CLIENT_SNDHWM)
+    new_socket.setsockopt.assert_any_call(zmq.LINGER, 0)
+    new_socket.connect.assert_called_once_with(client.server_url)
+    loop._poller.unregister.assert_called_once_with(old_socket)
+    loop._poller.register.assert_called_once_with(new_socket, zmq.POLLIN)
+    assert loop._socket_to_client == {new_socket: client}
+
+
 def test_timed_out_unregister_is_retired_when_loop_recovers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Any, Generic, Optional, TypeVar
+from typing import Any, Callable, Generic, Optional, TypeVar
 import threading
 
 # First Party
@@ -11,12 +11,13 @@ T = TypeVar("T")
 
 
 class MessagingFuture(Generic[T]):
-    def __init__(self):
+    def __init__(self, on_timeout: Callable[[], None] | None = None):
         self.is_done_ = threading.Event()
         self.result_ = None
         self.exception_: BaseException | None = None
         self._completion_lock = threading.Lock()
         self._retained_resources: list[Any] = []
+        self._on_timeout = on_timeout
 
     def query(self) -> bool:
         """
@@ -56,13 +57,19 @@ class MessagingFuture(Generic[T]):
         """
         flag = self.wait(timeout)
         if not flag:
-            raise LMCacheTimeoutError("Future result not available within timeout")
+            timeout_error = LMCacheTimeoutError(
+                "Future result not available within timeout"
+            )
+            if self._expire(timeout_error):
+                raise timeout_error
+            # Completion won the deadline race while wait() was returning.
+            # Fall through and consume that terminal state.
         if self.exception_ is not None:
             raise self.exception_
         return self.result_
 
     def retain_until_complete(self, resource: Any) -> None:
-        """Keep ``resource`` alive until this future receives a response."""
+        """Keep ``resource`` alive until this future first becomes terminal."""
         with self._completion_lock:
             if not self.is_done_.is_set():
                 self._retained_resources.append(resource)
@@ -76,19 +83,13 @@ class MessagingFuture(Generic[T]):
         Args:
             result (T): The result to set.
         """
-        with self._completion_lock:
-            self.result_ = result
-            self._retained_resources.clear()
-            self.is_done_.set()
+        self._complete(result=result)
 
     def set_exception(self, exception: BaseException) -> None:
         """Complete the future with an exception from the messaging system."""
         if not isinstance(exception, BaseException):
             raise TypeError("exception must derive from BaseException")
-        with self._completion_lock:
-            self.exception_ = exception
-            self._retained_resources.clear()
-            self.is_done_.set()
+        self._complete(exception=exception)
 
     def to_cuda_future(
         self,
@@ -99,6 +100,34 @@ class MessagingFuture(Generic[T]):
         return CUDAMessagingFuture.FromMessagingFuture(  # type: ignore
             self, device, completion_event
         )
+
+    def _complete(
+        self,
+        result: T | None = None,
+        exception: BaseException | None = None,
+    ) -> bool:
+        """Commit the first terminal state and release retained resources once."""
+        with self._completion_lock:
+            if self.is_done_.is_set():
+                return False
+            self.result_ = result
+            self.exception_ = exception
+            retained_resources = self._retained_resources
+            self._retained_resources = []
+            self.is_done_.set()
+
+        # Destructors may synchronize or invoke runtime cleanup. Run them
+        # outside the state lock after the terminal state is visible.
+        retained_resources.clear()
+        return True
+
+    def _expire(self, exception: BaseException) -> bool:
+        """Atomically expire an unanswered future and notify its transport."""
+        if not self._complete(exception=exception):
+            return False
+        if self._on_timeout is not None:
+            self._on_timeout()
+        return True
 
 
 class CUDAMessagingFuture(MessagingFuture[T]):
@@ -124,9 +153,9 @@ class CUDAMessagingFuture(MessagingFuture[T]):
         self.device_ = device if device is not None else torch_dev.current_device()
         if completion_event is not None:
             # The caller-visible CUDA future may be abandoned after a timeout.
-            # The raw MQ future remains pending until the server responds, so
-            # retain the exporter there while the server can still use its IPC
-            # handle.
+            # Keep an independent reference on the raw transport future until
+            # its first terminal state so caller abandonment cannot release an
+            # exporter while the request is still pending.
             raw_future.retain_until_complete(completion_event)
 
     def _on_raw_future_complete(self):
@@ -205,9 +234,13 @@ class CUDAMessagingFuture(MessagingFuture[T]):
         """
         flag = self.wait(timeout)
         if not flag:
-            raise LMCacheTimeoutError(
+            timeout_error = LMCacheTimeoutError(
                 "CUDAMessagingFuture result not available within timeout"
             )
+            if self.raw_future_._expire(timeout_error):
+                raise timeout_error
+            # The raw response won the timeout race; consume it normally.
+            return self.result()
 
         assert self.result_ is not None
         return self.result_
