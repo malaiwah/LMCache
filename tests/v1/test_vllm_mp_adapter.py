@@ -280,6 +280,24 @@ def test_chunked_store_keeps_all_futures_and_events(fake_adapter, monkeypatch):
     assert "req-1" not in adapter.store_events
 
 
+def test_raising_store_query_is_contained_and_releases_event(fake_adapter) -> None:
+    """A remote error surfaced by query cannot escape the engine step."""
+    adapter, _send_mock, _ = fake_adapter
+    future = MagicMock(name="store_future")
+    future.query.side_effect = RuntimeError("remote store failed")
+    event = MagicMock(name="store_event")
+    adapter.store_futures["req-1"] = [future]
+    adapter.store_events["req-1"] = [event]
+
+    finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
+
+    assert finished_stores == {"req-1"}
+    assert finished_retrieves == set()
+    assert "req-1" not in adapter.store_futures
+    assert "req-1" not in adapter.store_events
+    future.result.assert_not_called()
+
+
 def test_submit_store_request_expands_block_ids_to_views(fake_adapter, monkeypatch):
     adapter, _send_mock, _ = fake_adapter
     monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
@@ -832,6 +850,21 @@ def test_raising_retrieve_future_contained_as_failure(fake_adapter) -> None:
     assert finished_retrieves == {"req-1"}
     assert adapter.get_block_ids_with_load_errors() == {7, 8}
     assert adapter.retrieve_failure_count == 1
+
+
+def test_raising_retrieve_query_contained_as_failure(fake_adapter) -> None:
+    """CUDAMessagingFuture.query may surface the raw remote exception."""
+    adapter, _send_mock, _ = fake_adapter
+    future = MagicMock(name="retrieve_future")
+    future.query.side_effect = RuntimeError("remote retrieve failed")
+    adapter.retrieve_futures["req-1"] = (future, [9, 10])
+
+    _ret_stores, finished_retrieves = adapter.get_finished(set())
+
+    assert finished_retrieves == {"req-1"}
+    assert adapter.get_block_ids_with_load_errors() == {9, 10}
+    assert adapter.retrieve_failure_count == 1
+    future.result.assert_not_called()
 
 
 def test_successful_retrieve_marks_no_blocks_invalid(fake_adapter) -> None:

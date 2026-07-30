@@ -1620,11 +1620,24 @@ class LMCacheMPWorkerAdapter:
             pending_futures: list[MessagingFuture[StoreResult]] = []
             pending_events: list[_IpcEvent] = []
             for future, event in zip(futures, events, strict=True):
-                if not future.query():
-                    pending_futures.append(future)
-                    pending_events.append(event)
+                try:
+                    if not future.query():
+                        pending_futures.append(future)
+                        pending_events.append(event)
+                        continue
+                    store_succeeded = future.result()
+                except Exception as exc:
+                    # Remote/CUDA failures are completed store attempts. Do not
+                    # let one failed cache write terminate the engine step or
+                    # retain its blocks forever.
+                    logger.error(
+                        "LMCache store future raised for request_id=%s: %r "
+                        "-- treating as failed store.",
+                        request_id,
+                        exc,
+                    )
                     continue
-                if not future.result():
+                if not store_succeeded:
                     logger.error(
                         "Something went wrong when processing the "
                         "store request for request_id=%s",
@@ -1708,15 +1721,15 @@ class LMCacheMPWorkerAdapter:
         finished_stores = self._poll_store_futures()
         finished_retrieves = set()
         for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
-            if not r_future.query():
-                continue
-
             try:
+                if not r_future.query():
+                    continue
                 r_result = r_future.result()
             except Exception as exc:
                 # A raising future must not propagate out of get_finished
                 # (that would kill the engine step); contain it as a failed
-                # retrieve on the standard failure path.
+                # retrieve on the standard failure path. query() can raise
+                # while materializing a remote error from its raw future.
                 logger.error(
                     "LMCache retrieve future raised for request_id=%s: %r "
                     "-- treating as failed retrieve.",
