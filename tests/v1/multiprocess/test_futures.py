@@ -110,16 +110,19 @@ def test_messaging_future_wait_timeout():
 
 
 def test_messaging_future_result_timeout():
-    """Test result method raises TimeoutError when timeout is reached."""
+    """A result deadline terminally expires an unanswered future."""
     future = MessagingFuture[int]()
 
-    # Try to get result with timeout (result never set)
     with pytest.raises(
         TimeoutError, match="Future result not available within timeout"
     ):
         future.result(timeout=0.2)
 
-    assert not future.query(), "Future should not be done after timeout"
+    assert future.query(), "A result deadline should make the future terminal"
+    with pytest.raises(
+        TimeoutError, match="Future result not available within timeout"
+    ):
+        future.result()
 
 
 def test_messaging_future_wait_no_timeout():
