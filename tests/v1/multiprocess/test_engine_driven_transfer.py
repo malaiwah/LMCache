@@ -622,6 +622,67 @@ def test_musa_data_context_retrieve_uses_device_agnostic_scatter(
     assert "prefer_musa_native" not in captured_kwargs
 
 
+def test_lmcache_driven_requests_use_distinct_exporter_owned_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Batched requests derive independent events from one engine fence."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import worker_transfer
+    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+        LMCacheDrivenTransferContext,
+    )
+
+    stream = object()
+    created: list[Any] = []
+
+    class _FakeCompletionEvent:
+        def __init__(self, *, interprocess: bool) -> None:
+            assert interprocess
+            self.handle = f"event-{len(created)}".encode()
+            self.recorded_stream: object | None = None
+            created.append(self)
+
+        def record(self, event_stream: object) -> None:
+            self.recorded_stream = event_stream
+
+        def ipc_handle(self) -> bytes:
+            return self.handle
+
+    monkeypatch.setattr(worker_transfer.torch_dev, "Event", _FakeCompletionEvent)
+    monkeypatch.setattr(worker_transfer.torch_dev, "current_stream", lambda: stream)
+
+    predecessor = MagicMock()
+    raw_futures = [MagicMock(), MagicMock()]
+    results = [object(), object()]
+    for raw_future, result in zip(raw_futures, results, strict=True):
+        raw_future.to_cuda_future.return_value = result
+
+    context = LMCacheDrivenTransferContext()
+    context._mq_client = MagicMock()
+    context._send_request = MagicMock(side_effect=raw_futures)
+
+    store_result = context.submit_store("store", object(), 1, {}, [[1]], predecessor, 1)
+    retrieve_result = context.submit_retrieve(
+        "retrieve", object(), 1, {}, [[2]], predecessor, 1
+    )
+
+    assert [store_result, retrieve_result] == results
+    assert len(created) == 2
+    assert created[0] is not created[1]
+    assert [event.recorded_stream for event in created] == [stream, stream]
+    assert [item.kwargs for item in predecessor.wait.call_args_list] == [
+        {"stream": stream},
+        {"stream": stream},
+    ]
+    sent = context._send_request.call_args_list
+    assert sent[0].args[1] is RequestType.STORE
+    assert sent[0].args[2][-1] == created[0].handle
+    assert sent[1].args[1] is RequestType.RETRIEVE
+    assert sent[1].args[2][-2] == created[1].handle
+    raw_futures[0].to_cuda_future.assert_called_once_with(completion_event=created[0])
+    raw_futures[1].to_cuda_future.assert_called_once_with(completion_event=created[1])
+
+
 def test_create_transfer_context_env_var_overrides_default(
     monkeypatch: Any,
 ) -> None:

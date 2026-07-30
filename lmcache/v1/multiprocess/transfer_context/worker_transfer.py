@@ -168,6 +168,18 @@ class IPCEvent(Protocol):
     def wait(self, stream: object | None = None) -> None:
         """Make ``stream`` wait for this event (async ordering primitive)."""
 
+    def record(self, stream: object | None = None) -> None:
+        """Record this event on ``stream``."""
+
+
+def _make_completion_event(predecessor: IPCEvent) -> IPCEvent:
+    """Create a request-owned event ordered after a shared engine fence."""
+    stream = torch_dev.current_stream()
+    completion_event = torch_dev.Event(interprocess=True)
+    predecessor.wait(stream=stream)
+    completion_event.record(stream)
+    return completion_event
+
 
 SendRequest = Callable[[MessageQueueClient, RequestType, list[object]], MessagingFuture]
 
@@ -361,11 +373,12 @@ class LMCacheDrivenTransferContext(TransferContext):
                 "LMCache-driven transfer context is not registered. "
                 "Call register() before submit_store()."
             )
+        completion_event = _make_completion_event(event)
         return self._send_request(
             self._mq_client,
             RequestType.STORE,
-            [key, instance_id, block_ids, event.ipc_handle()],
-        ).to_cuda_future()
+            [key, instance_id, block_ids, completion_event.ipc_handle()],
+        ).to_cuda_future(completion_event=completion_event)
 
     def submit_retrieve(
         self,
@@ -383,11 +396,18 @@ class LMCacheDrivenTransferContext(TransferContext):
                 "LMCache-driven transfer context is not registered. "
                 "Call register() before submit_retrieve()."
             )
+        completion_event = _make_completion_event(event)
         return self._send_request(
             self._mq_client,
             RequestType.RETRIEVE,
-            [key, instance_id, block_ids, event.ipc_handle(), skip_first_n_tokens],
-        ).to_cuda_future()
+            [
+                key,
+                instance_id,
+                block_ids,
+                completion_event.ipc_handle(),
+                skip_first_n_tokens,
+            ],
+        ).to_cuda_future(completion_event=completion_event)
 
     def close(self) -> None:
         self._mq_client = None

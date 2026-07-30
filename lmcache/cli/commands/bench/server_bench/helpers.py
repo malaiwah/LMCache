@@ -135,6 +135,11 @@ _DEFAULT_RPC_TIMEOUT_S = 10.0
 # can disambiguate it from a legitimate ``None`` (void) reply.
 _TIMEOUT = object()
 
+# A timed-out handle request may still be using its exported event in the
+# server. Retain those rare events for the remaining lifetime of the bench
+# process rather than destroying an exporter that another process may open.
+_TIMED_OUT_IPC_EVENTS: list[Any] = []
+
 
 def _call(
     client: MessageQueueClient,
@@ -486,19 +491,18 @@ def _poll_prefetch_status(
     return None
 
 
-def _make_event_handle(use_gpu: bool = True) -> bytes:
-    """Create a CUDA event IPC handle for GPU mode.
+def _make_event(use_gpu: bool = True) -> Any | None:
+    """Create and retain a worker-owned CUDA event for a handle request.
 
-    CPU mode does not need a cross-process event (SHM mappings are
-    coherent without device-side sync), so an empty handle is
-    returned and the server treats it as a no-op.
+    CPU mode does not need a cross-process event because SHM mappings are
+    coherent without device-side synchronization.
     """
     if not use_gpu:
-        return b""
+        return None
     check_interprocess_event_support()
     event = torch_dev.Event(interprocess=True)
     event.record()
-    return event.ipc_handle()
+    return event
 
 
 def _build_server_slot_views(
@@ -701,15 +705,20 @@ def _send_store(
         num_tokens = key.end - key.start
         num_blocks = num_tokens // block_size
         block_ids = list(range(block_offset, block_offset + num_blocks))
+        completion_event = _make_event()
         payloads = [
             key,
-            _INSTANCE_ID,
+            0,
             [block_ids] * num_engine_group_infos,
-            _make_event_handle(),
+            completion_event.ipc_handle() if completion_event is not None else b"",
         ]
         result = _call(client, RequestType.STORE, payloads)
+        if result is _TIMEOUT and completion_event is not None:
+            _TIMED_OUT_IPC_EVENTS.append(completion_event)
         if result is _TIMEOUT:
             return "timeout"
+        if completion_event is not None:
+            completion_event.synchronize()
         return "stored" if result[1] else "store_failed"
 
     # CPU mode: PREPARE_STORE -> COMMIT_STORE
@@ -770,16 +779,21 @@ def _send_retrieve(
         hit_tokens = hit_chunks * chunk_size
         num_blocks = hit_tokens // block_size
         block_ids = list(range(block_offset, block_offset + num_blocks))
+        completion_event = _make_event()
         payloads = [
             key,
-            _INSTANCE_ID,
+            0,
             [block_ids] * num_engine_group_infos,
-            _make_event_handle(),
+            completion_event.ipc_handle() if completion_event is not None else b"",
             0,  # skip_first_n_tokens
         ]
         result = _call(client, RequestType.RETRIEVE, payloads)
+        if result is _TIMEOUT and completion_event is not None:
+            _TIMED_OUT_IPC_EVENTS.append(completion_event)
         if result is _TIMEOUT:
             return "timeout"
+        if completion_event is not None:
+            completion_event.synchronize()
         return "retrieved" if result[1] else "retrieve_failed"
 
     # CPU mode: PREPARE_RETRIEVE -> COMMIT_RETRIEVE

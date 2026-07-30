@@ -10,6 +10,8 @@ Covers:
 # Standard
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import argparse
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 import json
 import threading
 
@@ -29,9 +31,12 @@ from lmcache.cli.commands.bench.server_bench.helpers import (
     _query_checksum,
     _send_lookup,
     _send_unregister_kv_cache,
+    _send_retrieve,
+    _send_store,
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocols.base import RequestType
+import lmcache.cli.commands.bench.server_bench.helpers as helpers_mod
 
 # ------------------------------------------------------------------ #
 #  Fixtures
@@ -480,6 +485,43 @@ class _LookupRouter:
                 else:
                     body = msgspec.msgpack.encode(self._hit_chunks)
                 self._router.send_multipart([identity, uid_f, type_f, body])
+
+
+class TestHandleTransferEvents:
+    @pytest.mark.parametrize(
+        ("send", "request_type"),
+        [
+            (_send_store, RequestType.STORE),
+            (_send_retrieve, RequestType.RETRIEVE),
+        ],
+    )
+    def test_worker_event_lives_through_response_and_is_synchronized(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        send,
+        request_type: RequestType,
+    ) -> None:
+        event = MagicMock()
+        event.ipc_handle.return_value = b"worker-event"
+        call = MagicMock(return_value=(b"worker-event", True))
+        monkeypatch.setattr(helpers_mod, "_make_event", lambda: event)
+        monkeypatch.setattr(helpers_mod, "_call", call)
+        extra = {"hit_chunks": 1} if send is _send_retrieve else {}
+
+        result = send(
+            MagicMock(),
+            SimpleNamespace(start=0, end=16),
+            block_size=16,
+            chunk_size=16,
+            use_handle=True,
+            **extra,
+        )
+
+        assert result in {"stored", "retrieved"}
+        payload = call.call_args.args[2]
+        assert call.call_args.args[1] is request_type
+        assert payload[3] == b"worker-event"
+        event.synchronize.assert_called_once_with()
 
 
 class TestLookupProtocol:

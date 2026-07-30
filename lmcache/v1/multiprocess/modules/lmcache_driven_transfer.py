@@ -944,14 +944,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             instance_id: The GPU instance ID (such as PID).
             gpu_block_ids: GPU block IDs to store, indexed by LMCache KV
                 group index.
-            event_ipc_handle: The IPC handle of the event to wait on.
+            event_ipc_handle: IPC handle for a worker-owned request event.
+                The server waits on its initial recording before reading GPU
+                blocks, then records it again after the D2H transfer.
 
         Returns:
-            A tuple where the first element is the IPC handle of the event
-            that signals the completion of the store operation, and the second
-            element indicates whether the store operation completed without a
-            fatal error (not whether every requested chunk was stored; see
-            Notes).
+            The same worker-owned event handle, re-recorded to signal transfer
+            completion, plus whether the store completed without a fatal error
+            (not whether every requested chunk was stored; see Notes).
 
         Raises:
             ValueError: If no GPU context is registered for the given instance ID.
@@ -994,7 +994,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             torch_dev.stream(cache_context.stream),
         ):
             check_interprocess_event_support()
-            event = torch_dev.Event(interprocess=True)
 
             # Fail closed: every LMCache group must have block IDs covering all
             # chunks. A short list (e.g. a caller/protocol bug) would otherwise
@@ -1017,8 +1016,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     num_chunks,
                     blocks_per_chunk,
                 )
-                event.record()
-                return event.ipc_handle(), False
+                return event_ipc_handle, False
 
             block_ids_per_group_gpu = downsample_and_stage_block_ids(
                 cache_context, gpu_block_ids
@@ -1100,9 +1098,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 store_succeeded = True
             except Exception:
                 logger.exception("Cannot store keys due to exception")
-                return event.ipc_handle(), False
+                return event_ipc_handle, False
             finally:
-                event.record()
+                vllm_event.record()
                 # Fail closed: commit the reserved objects only when every chunk
                 # copied successfully; otherwise the whole store is skipped.
                 stored_count = len(all_dict) if store_succeeded else 0
@@ -1138,7 +1136,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 num_chunks * self._ctx.chunk_size,
                 ed - st,
             )
-        return event.ipc_handle(), True
+        return event_ipc_handle, True
 
     @_lmcache_nvtx_annotate
     def retrieve(
@@ -1157,16 +1155,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             instance_id: The GPU instance ID (such as PID).
             gpu_block_ids: GPU block IDs to retrieve into, indexed by LMCache
                 KV group index.
-            event_ipc_handle: The IPC handle of the event to wait on.
+            event_ipc_handle: IPC handle for a worker-owned request event.
+                The server waits on its initial recording before writing GPU
+                blocks, then records it again after the H2D transfer.
             skip_first_n_tokens: Number of tokens to skip writing at
                 the start of the retrieve range. This avoids overwriting
                 APC-shared GPU blocks that may be read concurrently by other
                 requests.
 
         Returns:
-            A tuple where the first element is the IPC handle of the event
-            that signals the completion of the retrieve operation, and the
-            second element indicates whether the key was successfully retrieved.
+            The same worker-owned event handle, re-recorded to signal transfer
+            completion, plus whether the key was successfully retrieved.
 
         Raises:
             ValueError: If no GPU context is registered for the given instance ID.
@@ -1221,7 +1220,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             torch_dev.stream(cache_context.stream),
         ):
             check_interprocess_event_support()
-            event = torch_dev.Event(interprocess=True)
 
             # Fail closed: a short block-id list would drive the transfer
             # kernel to write out-of-bounds GPU memory. Checked on the raw
@@ -1242,8 +1240,18 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     num_chunks,
                     blocks_per_chunk,
                 )
-                event.record()
-                return event.ipc_handle(), False
+                return event_ipc_handle, False
+
+            if not hasattr(torch_dev.Event, "from_ipc_handle"):
+                raise RuntimeError(
+                    f"Backend '{torch_device_type}' does not support IPC event "
+                    "handles (Event.from_ipc_handle not available). "
+                    "Multiprocess IPC requires CUDA."
+                )
+            vllm_event = torch_dev.Event.from_ipc_handle(
+                cache_context.device, event_ipc_handle
+            )
+            vllm_event.wait(stream=cache_context.stream)
 
             # Cut and stage all block_ids to GPU once before the transfer
             block_ids_per_group_gpu = downsample_and_stage_block_ids(
@@ -1260,7 +1268,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     ) as memory_objs:
                         if not memory_objs or len(memory_objs) != len(obj_keys):
                             logger.error("Some keys not found during retrieve!")
-                            return event.ipc_handle(), False
+                            return event_ipc_handle, False
 
                         total_bytes += sum(mo.get_size() for mo in memory_objs)
 
@@ -1279,9 +1287,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         prefetched_keys.extend(obj_keys)
             except Exception:
                 logger.exception("Cannot retrieve keys due to exception")
-                return event.ipc_handle(), False
+                return event_ipc_handle, False
             finally:
-                event.record()
+                vllm_event.record()
                 if prefetched_keys:
                     submit_callback_to_stream(
                         cache_context.cupy_stream,
@@ -1317,4 +1325,4 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             ed - st,
         )
 
-        return event.ipc_handle(), True
+        return event_ipc_handle, True

@@ -15,6 +15,8 @@ class MessagingFuture(Generic[T]):
         self.is_done_ = threading.Event()
         self.result_ = None
         self.exception_: BaseException | None = None
+        self._completion_lock = threading.Lock()
+        self._retained_resources: list[Any] = []
 
     def query(self) -> bool:
         """
@@ -59,6 +61,12 @@ class MessagingFuture(Generic[T]):
             raise self.exception_
         return self.result_
 
+    def retain_until_complete(self, resource: Any) -> None:
+        """Keep ``resource`` alive until this future receives a response."""
+        with self._completion_lock:
+            if not self.is_done_.is_set():
+                self._retained_resources.append(resource)
+
     def set_result(self, result: T) -> None:
         """
         Set the result of the future and mark it as done. This function is NOT
@@ -68,43 +76,58 @@ class MessagingFuture(Generic[T]):
         Args:
             result (T): The result to set.
         """
-        self.result_ = result
-        self.is_done_.set()
+        with self._completion_lock:
+            self.result_ = result
+            self._retained_resources.clear()
+            self.is_done_.set()
 
     def set_exception(self, exception: BaseException) -> None:
         """Complete the future with an exception from the messaging system."""
         if not isinstance(exception, BaseException):
             raise TypeError("exception must derive from BaseException")
-        self.exception_ = exception
-        self.is_done_.set()
+        with self._completion_lock:
+            self.exception_ = exception
+            self._retained_resources.clear()
+            self.is_done_.set()
 
     def to_cuda_future(
         self,
         device: Any | None = None,
+        completion_event: Any | None = None,
     ) -> "CUDAMessagingFuture":
         # TODO: need extra type checking for the future type
-        return CUDAMessagingFuture.FromMessagingFuture(self, device)  # type: ignore
+        return CUDAMessagingFuture.FromMessagingFuture(  # type: ignore
+            self, device, completion_event
+        )
 
 
 class CUDAMessagingFuture(MessagingFuture[T]):
     """
-    The future class that wraps both result and a CUDA IPC event.
-    The `query`, `wait`, and `result` methods will pend on both the
-    original future and the CUDA event.
-    The original future should return tuple[bytes, T], where the first
-    element is the serialized CUDA event.
+    Wraps a result future and a CUDA IPC completion event. ``query``, ``wait``,
+    and ``result`` first wait for the response and then for device completion.
+    The original future returns ``tuple[bytes, T]``. When the exporter supplies
+    ``completion_event``, this future retains and synchronizes that local event;
+    otherwise it imports the serialized event for legacy callers.
     """
 
     def __init__(
         self,
         raw_future: MessagingFuture[tuple[bytes, T]],
         device: Any | None = None,
+        completion_event: Any | None = None,
     ) -> None:
         super().__init__()
         self.raw_future_ = raw_future
         self.event_: Any | None = None
+        self.exported_event_: Any | None = completion_event
         self.result_: T | None = None
         self.device_ = device if device is not None else torch_dev.current_device()
+        if completion_event is not None:
+            # The caller-visible CUDA future may be abandoned after a timeout.
+            # The raw MQ future remains pending until the server responds, so
+            # retain the exporter there while the server can still use its IPC
+            # handle.
+            raw_future.retain_until_complete(completion_event)
 
     def _on_raw_future_complete(self):
         """
@@ -113,7 +136,13 @@ class CUDAMessagingFuture(MessagingFuture[T]):
         event_bytes, result = self.raw_future_.result()
         self.result_ = result
 
-        # Not all backends support interprocess Events (CUDA IPC specific)
+        if self.exported_event_ is not None:
+            self.event_ = self.exported_event_
+            self.exported_event_ = None
+            return
+
+        # Legacy callers do not retain an exporter-owned event, so import the
+        # completion handle created by the server.
         if not hasattr(torch_dev, "Event") or not hasattr(
             torch_dev.Event, "from_ipc_handle"
         ):
@@ -209,5 +238,6 @@ class CUDAMessagingFuture(MessagingFuture[T]):
     def FromMessagingFuture(
         raw_future: MessagingFuture[tuple[bytes, T]],
         device: Any | None = None,
+        completion_event: Any | None = None,
     ) -> "CUDAMessagingFuture[T]":
-        return CUDAMessagingFuture(raw_future, device)
+        return CUDAMessagingFuture(raw_future, device, completion_event)

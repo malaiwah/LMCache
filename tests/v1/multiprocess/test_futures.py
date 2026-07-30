@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import gc
 import multiprocessing as mp
 import threading
 import time
+import weakref
 
 # Third Party
 import pytest
@@ -192,6 +194,60 @@ def test_messaging_future_rejects_non_exception():
 
     with pytest.raises(TypeError, match="must derive from BaseException"):
         future.set_exception("not an exception")  # type: ignore[arg-type]
+
+
+def test_cuda_future_retains_exporter_event_until_raw_response() -> None:
+    """A local IPC exporter is not observed before the server reply arrives."""
+
+    class _FakeEvent:
+        def __init__(self) -> None:
+            self.synchronize_calls = 0
+
+        def query(self) -> bool:
+            return True
+
+        def synchronize(self) -> None:
+            self.synchronize_calls += 1
+
+    event = _FakeEvent()
+    raw_future = MessagingFuture[tuple[bytes, int]]()
+    future = raw_future.to_cuda_future(
+        device="cuda:0",
+        completion_event=event,
+    )
+
+    # The event was initially recorded by the exporter, so it is already
+    # queryable. The response gate must still keep the operation pending.
+    assert not future.query()
+
+    raw_future.set_result((b"worker-owned-event", 42))
+    assert future.query()
+    assert future.result() == 42
+    assert future.event_ is event
+    assert event.synchronize_calls == 1
+
+
+def test_raw_future_retains_exporter_when_cuda_future_is_abandoned() -> None:
+    """A timed-out caller cannot destroy an event still in use by the server."""
+
+    class _FakeEvent:
+        pass
+
+    event = _FakeEvent()
+    event_ref = weakref.ref(event)
+    raw_future = MessagingFuture[tuple[bytes, bool]]()
+    cuda_future = raw_future.to_cuda_future(
+        device="cuda:0",
+        completion_event=event,
+    )
+
+    del event, cuda_future
+    gc.collect()
+    assert event_ref() is not None
+
+    raw_future.set_result((b"worker-owned-event", True))
+    gc.collect()
+    assert event_ref() is None
 
 
 # ==============================================================================

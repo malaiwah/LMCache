@@ -397,12 +397,13 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
         t0 = time.perf_counter()
         # Not all backends support interprocess Events (CUDA IPC specific)
         check_interprocess_event_support()
-        event = torch_dev.Event(interprocess=True)
-        event.record(stream)
 
         for req_id, spec in meta.loads.items():
             if not spec.tokens or not spec.block_ids:
                 continue
+
+            event = torch_dev.Event(interprocess=True)
+            event.record(stream)
 
             key = self._create_key(spec.tokens, req_id)
             try:
@@ -416,7 +417,9 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                         event.ipc_handle(),
                         0,  # skip_first_n_tokens
                     ],
-                ).result(timeout=self._mq_timeout)
+                ).to_cuda_future(completion_event=event).result(
+                    timeout=self._mq_timeout
+                )
             except Exception as e:
                 logger.warning(
                     "LMCache MP worker: retrieve failed for req %d: %s",
@@ -447,12 +450,13 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
         t0 = time.perf_counter()
         # Not all backends support interprocess Events (CUDA IPC specific)
         check_interprocess_event_support()
-        event = torch_dev.Event(interprocess=True)
-        event.record(stream)
 
         for req_id, spec in meta.saves.items():
             if not spec.tokens or not spec.block_ids:
                 continue
+
+            event = torch_dev.Event(interprocess=True)
+            event.record(stream)
 
             key = self._create_key(spec.tokens, req_id)
             try:
@@ -465,7 +469,9 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                         [spec.block_ids],
                         event.ipc_handle(),
                     ],
-                ).result(timeout=self._mq_timeout)
+                ).to_cuda_future(completion_event=event).result(
+                    timeout=self._mq_timeout
+                )
             except Exception as e:
                 logger.warning(
                     "LMCache MP worker: store failed for req %d: %s",
