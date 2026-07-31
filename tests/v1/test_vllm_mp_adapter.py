@@ -498,9 +498,7 @@ def test_scheduler_heartbeat_starts_from_empty_map_once_per_server(
         "tcp://server-a:5555": MagicMock(),
         "tcp://server-b:5555": MagicMock(),
     }
-    adapter._health_events = {
-        url: threading.Event() for url in adapter.mq_clients
-    }
+    adapter._health_events = {url: threading.Event() for url in adapter.mq_clients}
     adapter._heartbeat_interval = 5.0
     adapter._heartbeats = {}
     adapter._heartbeat_lock = threading.Lock()

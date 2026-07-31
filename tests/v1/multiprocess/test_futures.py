@@ -321,7 +321,7 @@ def test_completion_timeout_race_has_one_terminal_owner() -> None:
     class _Resource:
         pass
 
-    for _attempt in range(100):
+    def _run_race() -> None:
         timeout_notifications: list[str] = []
         releases: list[str] = []
         resource = _Resource()
@@ -370,6 +370,9 @@ def test_completion_timeout_race_has_one_terminal_owner() -> None:
         future.set_exception(ConnectionError("late"))
         gc.collect()
         assert releases == ["released"]
+
+    for _attempt in range(100):
+        _run_race()
 
 
 def test_cuda_timeout_releases_raw_lease_but_not_caller_lease() -> None:
