@@ -1488,9 +1488,7 @@ class LMCacheMPWorkerAdapter:
             # The context remains published so shutdown can close it after its
             # ordered UNREGISTER, but health must stay false.
             if self._shutdown_requested.is_set() or self._heartbeat_stop_requested():
-                logger.info(
-                    "Heartbeat stop requested during KV cache re-registration"
-                )
+                logger.info("Heartbeat stop requested during KV cache re-registration")
                 return False
         logger.warning("Finished re-registering KV caches after server recovery")
         return True
@@ -1943,9 +1941,7 @@ class LMCacheMPWorkerAdapter:
                 )
             except Exception as exc:
                 shutdown_error = exc
-                logger.exception(
-                    "LMCache unregister failed; continuing local shutdown"
-                )
+                logger.exception("LMCache unregister failed; continuing local shutdown")
 
             cleanup_steps = (
                 ("transfer context", transfer_ctx.close if transfer_ctx else None),
