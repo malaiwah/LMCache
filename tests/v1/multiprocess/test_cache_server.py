@@ -181,6 +181,35 @@ def lookup_all(
     return total
 
 
+def wait_for_lookup_count(
+    client: MessageQueueClient,
+    keys: list[IPCCacheServerKey],
+    expected_count: int,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> int:
+    """Retry lookup until the asynchronous store commit becomes visible.
+
+    The STORE completion event marks the GPU transfer complete. The server then
+    commits its write through the no-GIL completion dispatcher, so an immediate
+    lookup may still observe the object as write-locked and correctly miss.
+    """
+    deadline = time.monotonic() + timeout
+    observed_count = -1
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        observed_count = lookup_all(client, keys, timeout=remaining)
+        if observed_count == expected_count:
+            return observed_count
+        time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+
+    raise AssertionError(
+        f"lookup did not reach {expected_count} before timeout; "
+        f"last observed count was {observed_count}"
+    )
+
+
 def store_keys(
     client: MessageQueueClient,
     keys: list[IPCCacheServerKey],
@@ -479,7 +508,7 @@ def test_same_instance_reregister_after_reset_store_retrieve_unregister(
         store_event = torch.cuda.Event(interprocess=True)
         store_event.record()
         store_keys(client, [key], instance_id, source_block_ids, store_event)
-        assert lookup_all(client, [key]) == 1
+        assert wait_for_lookup_count(client, [key], expected_count=1) == 1
 
         for layer_cache in client_context.gpu_kv_caches:
             layer_cache[
