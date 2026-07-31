@@ -253,6 +253,55 @@ def _invoke_handler_with_ipc_cleanup(
         release_ipc_exports(decoded_payloads)
 
 
+class _BlockingPayloadCleanupOwner:
+    """Exactly-once owner for decoded payloads queued to an executor.
+
+    The MQ thread has already materialized receiver-owned IPC exports before
+    ``submit``. A queued task may be cancelled without ever invoking its
+    callable, so cleanup cannot live only in the callable's ``finally`` block.
+    The cancellation callback and task entry race for this owner: cancellation
+    may release only ``pending`` payloads, while a started task transitions the
+    owner to ``running`` and becomes the sole cleanup path.
+    """
+
+    def __init__(self, decoded_payloads: list[Any]) -> None:
+        self._decoded_payloads: list[Any] | None = decoded_payloads
+        self._state = "pending"
+        self._lock = threading.Lock()
+
+    def invoke(self, handler: Callable[..., Any]) -> Any:
+        """Transfer cleanup ownership to this worker and run ``handler``."""
+        with self._lock:
+            if self._state != "pending" or self._decoded_payloads is None:
+                raise RuntimeError("Blocking payload cleanup owner is unavailable")
+            self._state = "running"
+            decoded_payloads = self._decoded_payloads
+
+        try:
+            return handler(*decoded_payloads)
+        finally:
+            self._release_running(decoded_payloads)
+
+    def release_if_pending(self) -> bool:
+        """Release a cancelled/rejected task only if no worker started it."""
+        with self._lock:
+            if self._state != "pending" or self._decoded_payloads is None:
+                return False
+            decoded_payloads = self._decoded_payloads
+            self._decoded_payloads = None
+            self._state = "released"
+        release_ipc_exports(decoded_payloads)
+        return True
+
+    def _release_running(self, decoded_payloads: list[Any]) -> None:
+        with self._lock:
+            if self._state != "running":
+                return
+            self._decoded_payloads = None
+            self._state = "released"
+        release_ipc_exports(decoded_payloads)
+
+
 _SPECIAL_ENCODER_DECODERS = {
     DeviceIPCWrapper: (
         get_customized_encoder(DeviceIPCWrapper),
@@ -1116,21 +1165,31 @@ class BlockingRequestHandler(RequestHandlerBase[ResponseType]):
             "Call add_normal_thread_pool or add_affinity_thread_pool first."
         )
         decoded_payloads = unwrap_request_payloads(payloads, self.payload_clss)
+        cleanup_owner = _BlockingPayloadCleanupOwner(decoded_payloads)
         try:
             if isinstance(self.executor, AffinityThreadPool):
-                return self.executor.submit(
-                    _invoke_handler_with_ipc_cleanup,
+                future = self.executor.submit(
+                    cleanup_owner.invoke,
                     self.handler,
-                    decoded_payloads,
                     affinity_key=affinity_key,
                 )
-            return self.executor.submit(
-                _invoke_handler_with_ipc_cleanup, self.handler, decoded_payloads
-            )
+            else:
+                future = self.executor.submit(cleanup_owner.invoke, self.handler)
         except BaseException:
             # The worker never took ownership when task submission failed.
-            release_ipc_exports(decoded_payloads)
+            cleanup_owner.release_if_pending()
             raise
+
+        # ThreadPoolExecutor and AffinityThreadPool both complete cancelled
+        # futures without invoking the queued callable. Install this callback
+        # before returning the future to the server's shutdown tracker so a
+        # concurrent close cannot observe/cancel it first.
+        def _release_cancelled_payloads(completed: Future[Any]) -> None:
+            if completed.cancelled():
+                cleanup_owner.release_if_pending()
+
+        future.add_done_callback(_release_cancelled_payloads)
+        return future
 
     def get_response_class(self) -> ResponseType:
         return self.response_cls

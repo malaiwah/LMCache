@@ -2277,33 +2277,70 @@ def test_blocking_handler_failure_completes_future():
         server.close()
 
 
-def test_server_close_cancels_queued_handler_and_drains_active_handler() -> None:
-    """Transport teardown waits until callbacks can no longer notify it."""
+@pytest.mark.parametrize("pool_kind", ["normal", "affinity"])
+def test_server_close_releases_cancelled_queued_ipc_payload_once(
+    pool_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation and worker start have one receiver-cleanup owner."""
     context = zmq.Context.instance()
-    server_url = "tcp://127.0.0.1:16031"
+    port = 16031 if pool_kind == "normal" else 16033
+    server_url = f"tcp://127.0.0.1:{port}"
     server = MessageQueueServer(server_url, context)
     active_started = threading.Event()
     release_active = threading.Event()
-    calls: list[int] = []
+    sender_wrappers = [_TrackedIPCWrapper(), _TrackedIPCWrapper()]
+    receiver_wrappers = [_TrackedIPCWrapper(), _TrackedIPCWrapper()]
+    calls: list[_TrackedIPCWrapper] = []
+    monkeypatch.setattr(mq_mod, "_SENT_UNANSWERED_IPC_QUARANTINE", [])
+    monkeypatch.setattr(mq_mod, "_SENT_UNANSWERED_TRANSPORT_QUARANTINE", [])
 
-    def blocking_lookup(_key: IPCCacheServerKey, _worker_id: int) -> None:
-        calls.append(1)
+    original_get_payload_classes = mq_mod.get_payload_classes
+    original_encode = mq_mod.msgspec_encode
+    original_decode = mq_mod.msgspec_decode
+    receiver_iter = iter(receiver_wrappers)
+
+    def payload_classes(request_type: RequestType) -> list[Any]:
+        if request_type is RequestType.NOOP:
+            return [DeviceIPCWrapper]
+        return original_get_payload_classes(request_type)
+
+    def encode(value: Any, cls: Any) -> bytes:
+        if cls is DeviceIPCWrapper:
+            return b"tracked-ipc-wrapper"
+        return original_encode(value, cls=cls)
+
+    def decode(value: bytes, cls: Any) -> Any:
+        if cls is DeviceIPCWrapper:
+            return next(receiver_iter)
+        return original_decode(value, cls=cls)
+
+    monkeypatch.setattr(mq_mod, "get_payload_classes", payload_classes)
+    monkeypatch.setattr(mq_mod, "msgspec_encode", encode)
+    monkeypatch.setattr(mq_mod, "msgspec_decode", decode)
+
+    def blocking_noop(wrapper: _TrackedIPCWrapper) -> str:
+        calls.append(wrapper)
         active_started.set()
         assert release_active.wait(timeout=5)
+        return "ok"
 
     server.add_blocking_handler(
-        RequestType.LOOKUP,
-        get_payload_classes(RequestType.LOOKUP),
-        blocking_lookup,
+        RequestType.NOOP,
+        [DeviceIPCWrapper],
+        blocking_noop,
     )
-    server.add_normal_thread_pool([RequestType.LOOKUP], max_workers=1)
+    if pool_kind == "normal":
+        server.add_normal_thread_pool([RequestType.NOOP], max_workers=1)
+    else:
+        server.add_affinity_thread_pool([RequestType.NOOP], max_workers=1)
     server.start()
     client = MessageQueueClient(server_url, context)
     close_errors: list[BaseException] = []
 
     try:
-        client.submit_request(RequestType.LOOKUP, [create_cache_key(7101), 1])
-        client.submit_request(RequestType.LOOKUP, [create_cache_key(7102), 1])
+        for wrapper in sender_wrappers:
+            client.submit_request(RequestType.NOOP, [wrapper])
         assert active_started.wait(timeout=2)
         deadline = time.monotonic() + 2
         with server._handler_futures_cv:
@@ -2311,6 +2348,13 @@ def test_server_close_cancels_queued_handler_and_drains_active_handler() -> None
                 remaining = deadline - time.monotonic()
                 assert remaining > 0
                 server._handler_futures_cv.wait(timeout=remaining)
+
+        assert calls == [receiver_wrappers[0]]
+        assert all(wrapper.release_calls == 0 for wrapper in receiver_wrappers)
+        assert all(wrapper.state == "transferred" for wrapper in sender_wrappers)
+        assert all(wrapper.transfer_calls == 1 for wrapper in sender_wrappers)
+        assert all(wrapper.release_calls == 0 for wrapper in sender_wrappers)
+        assert mq_mod._SENT_UNANSWERED_IPC_QUARANTINE == []
 
         def close_server() -> None:
             try:
@@ -2327,14 +2371,28 @@ def test_server_close_cancels_queued_handler_and_drains_active_handler() -> None
                 assert remaining > 0
                 server._handler_futures_cv.wait(timeout=remaining)
         assert closer.is_alive(), "close returned while the active handler was running"
+        # The cancelled callable never ran, yet its already-decoded receiver
+        # reservation is returned immediately by the Future callback.
+        assert receiver_wrappers[0].release_calls == 0
+        assert receiver_wrappers[1].release_calls == 1
+        assert calls == [receiver_wrappers[0]]
         release_active.set()
         closer.join(timeout=2)
 
         assert not closer.is_alive()
         assert close_errors == []
-        assert calls == [1], "the queued handler must be cancelled, not started"
+        assert calls == [receiver_wrappers[0]]
+        assert all(wrapper.release_calls == 1 for wrapper in receiver_wrappers)
+        assert all(wrapper.transfer_calls == 0 for wrapper in receiver_wrappers)
+        assert all(wrapper.state == "transferred" for wrapper in sender_wrappers)
+        assert all(wrapper.release_calls == 0 for wrapper in sender_wrappers)
         assert server._handler_futures == set()
         assert server._closed
+
+        # Destructors are not the cleanup mechanism and cannot double-release.
+        gc.collect()
+        assert all(wrapper.release_calls == 1 for wrapper in receiver_wrappers)
+        assert all(wrapper.release_calls == 0 for wrapper in sender_wrappers)
     finally:
         release_active.set()
         if not server._closed:
