@@ -273,6 +273,7 @@ def test_receiver_can_serialize_and_transfer_ownership_again(
     monkeypatch.setattr(CudaIPCWrapper, "_release_counter", release_counter)
 
     encoded = DeviceIPCWrapper.Serialize(sender)
+    assert sender.mark_ipc_export_transferred() is True
     receiver = DeviceIPCWrapper.Deserialize(encoded)
     downstream_bytes = DeviceIPCWrapper.Serialize(receiver)
     assert receiver.mark_ipc_export_transferred() is True

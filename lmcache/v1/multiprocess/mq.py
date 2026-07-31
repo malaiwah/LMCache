@@ -41,6 +41,7 @@ from lmcache.v1.platform.base_ipc_wrapper import (
     acquire_ipc_export_lease,
     mark_ipc_exports_transferred_strict,
     release_ipc_exports,
+    snapshot_ipc_exports,
 )
 
 logger = init_logger(__name__)
@@ -87,6 +88,66 @@ def _remove_provisional_ipc_quarantine(value: Any) -> bool:
                 del _SENT_UNANSWERED_IPC_QUARANTINE[index]
                 return True
     return False
+
+
+def _snapshot_request_payloads(values: list[Any]) -> tuple[Any, ...]:
+    """Detach built-in protocol containers from caller mutation.
+
+    Device wrappers and opaque leaf objects retain identity; list/dict/tuple/
+    set containers (the same graph shapes traversed by IPC ownership helpers)
+    are recursively copied. The polling thread serializes only this private
+    graph, and ownership is captured from it once at submission.
+    """
+    in_progress = object()
+    memo: dict[int, Any] = {}
+
+    def clone(value: Any) -> Any:
+        if isinstance(value, DeviceIPCWrapper):
+            return value
+        identity = id(value)
+        if identity in memo:
+            cloned = memo[identity]
+            if cloned is in_progress:
+                raise ValueError("Recursive immutable MQ payload container")
+            return cloned
+        if isinstance(value, list):
+            cloned_list: list[Any] = []
+            memo[identity] = cloned_list
+            cloned_list.extend(clone(item) for item in value)
+            return cloned_list
+        if isinstance(value, dict):
+            cloned_dict: dict[Any, Any] = {}
+            memo[identity] = cloned_dict
+            for key, item in value.items():
+                cloned_dict[key] = clone(item)
+            return cloned_dict
+        if isinstance(value, tuple):
+            memo[identity] = in_progress
+            cloned_tuple = tuple(clone(item) for item in value)
+            memo[identity] = cloned_tuple
+            return cloned_tuple
+        if isinstance(value, set):
+            cloned_set: set[Any] = set()
+            memo[identity] = cloned_set
+            for item in value:
+                cloned_set.add(clone(item))
+            return cloned_set
+        if isinstance(value, frozenset):
+            memo[identity] = in_progress
+            cloned_frozenset = frozenset(clone(item) for item in value)
+            memo[identity] = cloned_frozenset
+            return cloned_frozenset
+        return value
+
+    return tuple(clone(value) for value in values)
+
+
+@dataclass(frozen=True)
+class _IPCTransportOwnership:
+    """Immutable wrapper identity set and its asynchronous lifetime lease."""
+
+    exports: tuple[DeviceIPCWrapper, ...]
+    lease: IPCExportLease
 
 
 class RemoteHandlerError(RuntimeError):
@@ -140,28 +201,23 @@ def _decode_and_release_known_wire_payloads(
     """Best-effort consume/release wrappers in rejected wire payloads.
 
     A sender transfers CUDA IPC ownership when ZeroMQ accepts the multipart
-    message. Even when the receiver has no handler or rejects the frame count,
-    every payload whose declared protocol type is known must be decoded so its
-    one-shot wrapper can explicitly return the producer reservation.
+    message. Even when the receiver has no handler, rejects the frame count, or
+    cannot decode the request type, every frame must be decoded exactly once so
+    one-shot wrappers can explicitly return the producer reservation.
+
+    Rejection cleanup intentionally ignores the declared schema and uses the
+    customized ``Any`` decoder for *all* frames. A typed decoder can materialize
+    a wrapper and then fail on a later field; retrying that same frame as Any
+    would create a second receiver for one refcounter reservation.
     """
+    del payload_clss  # Kept in the signature for compatibility with callers.
     decoded_payloads: list[Any] = []
-    for payload, cls in zip(b_payloads, payload_clss, strict=False):
-        try:
-            decoded_payloads.append(msgspec_decode(payload, cls=cls))
-        except BaseException:
-            logger.exception(
-                "Failed to decode rejected MQ payload of declared type %s",
-                getattr(cls, "__name__", repr(cls)),
-            )
-    # A newer/mismatched sender may append frames beyond this receiver's
-    # protocol schema. Decode those frames as Any using the same extension
-    # hook so nested DeviceIPCWrapper values still materialize and release.
     generic_decoder = get_customized_decoder(Any)
-    for payload in b_payloads[len(payload_clss) :]:
+    for payload in b_payloads:
         try:
             decoded_payloads.append(generic_decoder.decode(payload))
         except BaseException:
-            logger.exception("Failed to decode rejected extra MQ payload frame")
+            logger.exception("Failed to decode rejected MQ payload frame")
     release_ipc_exports(decoded_payloads)
 
 
@@ -467,8 +523,20 @@ class MessageQueueClient:
         request_uid: RequestUID
         future: MessagingFuture[Any]
         request_type: RequestType
-        request_payloads: list[Any]
-        ipc_lease: IPCExportLease = field(default_factory=lambda: IPCExportLease(()))
+        request_payloads: tuple[Any, ...] | list[Any]
+        ipc_ownership: _IPCTransportOwnership = field(
+            default_factory=lambda: _IPCTransportOwnership((), IPCExportLease(()))
+        )
+
+        def __post_init__(self) -> None:
+            # Compatibility for lightweight tests/callers that construct this
+            # internal record directly rather than through submit_request().
+            if not self.ipc_ownership.exports:
+                exports = snapshot_ipc_exports(self.request_payloads)
+                if exports:
+                    self.ipc_ownership = _IPCTransportOwnership(
+                        exports, self.ipc_ownership.lease
+                    )
 
     def __init__(self, server_url: str, context: zmq.Context):
         self.ctx = context
@@ -481,7 +549,7 @@ class MessageQueueClient:
         # Pending job's futures
         self._request_counter = itertools.count()
         self.pending_futures: dict[int, MessagingFuture[Any]] = {}
-        self._inflight_payloads: dict[int, list[Any]] = {}
+        self._inflight_ownership: dict[int, _IPCTransportOwnership] = {}
         self._closed = False
         self._socket_closed = False
         self._socket_close_lock = threading.Lock()
@@ -497,15 +565,15 @@ class MessageQueueClient:
     def process_outbound_task(self) -> None:
         # Some tests and compatibility callers allocate lightweight clients
         # through __new__; initialize the additive tracking map lazily too.
-        if not hasattr(self, "_inflight_payloads"):
-            self._inflight_payloads = {}
+        if not hasattr(self, "_inflight_ownership"):
+            self._inflight_ownership = {}
         # Reclaim only transport-complete futures here. A caller timeout after
         # send is terminal to the caller but the remote side may still open,
         # wait on, or re-record CUDA IPC handles embedded in the request.
         for request_uid, future in list(self.pending_futures.items()):
             if future.transport_complete:
                 self.pending_futures.pop(request_uid, None)
-                self._inflight_payloads.pop(request_uid, None)
+                self._inflight_ownership.pop(request_uid, None)
 
         while True:
             try:
@@ -516,8 +584,8 @@ class MessageQueueClient:
                 # The caller's deadline elapsed before this request left the
                 # lifecycle-aware input queue. The remote never saw its
                 # transport resources, so they are safe to release now.
-                release_ipc_exports(wrapped_request.request_payloads)
-                wrapped_request.ipc_lease.release()
+                release_ipc_exports(wrapped_request.ipc_ownership.exports)
+                wrapped_request.ipc_ownership.lease.release()
                 wrapped_request.future.complete_transport()
                 continue
 
@@ -556,14 +624,12 @@ class MessageQueueClient:
                 # Register immediately before the atomic nonblocking send so a
                 # fast response cannot race pending-future publication.
                 self.pending_futures[request_uid] = wrapped_request.future
-                self._inflight_payloads[request_uid] = wrapped_request.request_payloads
+                self._inflight_ownership[request_uid] = wrapped_request.ipc_ownership
                 # Establish a strong, process-lifetime producer pin *before*
                 # the atomic send. If any post-send ownership bookkeeping is
                 # ambiguous, the pin stays installed even after a fast reply
                 # removes the ordinary in-flight tracking entry.
-                _quarantine_sent_unanswered_ipc_exports(
-                    wrapped_request.request_payloads
-                )
+                _quarantine_sent_unanswered_ipc_exports(wrapped_request.ipc_ownership)
                 provisionally_quarantined = True
                 self.socket.send_multipart(
                     [b_request_uid, b_request_type] + b_payloads,
@@ -571,11 +637,11 @@ class MessageQueueClient:
                 )
             except zmq.Again:
                 self.pending_futures.pop(request_uid, None)
-                self._inflight_payloads.pop(request_uid, None)
+                self._inflight_ownership.pop(request_uid, None)
                 if provisionally_quarantined:
-                    _remove_provisional_ipc_quarantine(wrapped_request.request_payloads)
-                release_ipc_exports(wrapped_request.request_payloads)
-                wrapped_request.ipc_lease.release()
+                    _remove_provisional_ipc_quarantine(wrapped_request.ipc_ownership)
+                release_ipc_exports(wrapped_request.ipc_ownership.exports)
+                wrapped_request.ipc_ownership.lease.release()
                 wrapped_request.future.set_exception(
                     RuntimeError("LMCache MQ send queue is full; server is unreachable")
                 )
@@ -586,11 +652,11 @@ class MessageQueueClient:
                 )
             except Exception as exc:
                 self.pending_futures.pop(request_uid, None)
-                self._inflight_payloads.pop(request_uid, None)
+                self._inflight_ownership.pop(request_uid, None)
                 if provisionally_quarantined:
-                    _remove_provisional_ipc_quarantine(wrapped_request.request_payloads)
-                release_ipc_exports(wrapped_request.request_payloads)
-                wrapped_request.ipc_lease.release()
+                    _remove_provisional_ipc_quarantine(wrapped_request.ipc_ownership)
+                release_ipc_exports(wrapped_request.ipc_ownership.exports)
+                wrapped_request.ipc_ownership.lease.release()
                 wrapped_request.future.set_exception(exc)
                 logger.exception("Cannot send LMCache MQ request_uid=%d", request_uid)
             else:
@@ -602,7 +668,7 @@ class MessageQueueClient:
                 # refcounter.
                 try:
                     transfer_recorded = mark_ipc_exports_transferred_strict(
-                        wrapped_request.request_payloads
+                        wrapped_request.ipc_ownership.exports
                     )
                 except BaseException:
                     transfer_recorded = False
@@ -618,7 +684,7 @@ class MessageQueueClient:
                 if transfer_recorded:
                     try:
                         _remove_provisional_ipc_quarantine(
-                            wrapped_request.request_payloads
+                            wrapped_request.ipc_ownership
                         )
                     except BaseException:
                         # Failure to remove only leaks the already-transferred
@@ -643,7 +709,12 @@ class MessageQueueClient:
                     except BaseException:
                         pass
                 try:
-                    wrapped_request.ipc_lease.release()
+                    if transfer_recorded:
+                        wrapped_request.ipc_ownership.lease.release()
+                    # On ambiguity, retain the ownership record *with its live
+                    # lease* process-lifetime. This suppresses deferred handler
+                    # cleanup even if a wrapper-specific quarantine hook failed
+                    # or strict discovery stopped before visiting later exports.
                 except BaseException:
                     # Lease cleanup failures are also non-fatal post-send. The
                     # accepted transport must remain eligible for its reply.
@@ -663,8 +734,8 @@ class MessageQueueClient:
         is readable.  Only touches ``pending_futures``, which is
         exclusively accessed from the loop thread.
         """
-        if not hasattr(self, "_inflight_payloads"):
-            self._inflight_payloads = {}
+        if not hasattr(self, "_inflight_ownership"):
+            self._inflight_ownership = {}
         msg = self.socket.recv_multipart()
         if len(msg) < 2:
             logger.error(
@@ -679,34 +750,38 @@ class MessageQueueClient:
         response_cls = get_response_class(request_type)
 
         if request_uid in self.pending_futures:
-            future = self.pending_futures.pop(request_uid)
-            self._inflight_payloads.pop(request_uid, None)
-            if b_response and b_response[0] == _ERROR_RESPONSE_MARKER:
-                if len(b_response) != 2:
-                    future.set_exception(
-                        RuntimeError("Malformed LMCache RPC error response")
-                    )
-                    return
-                try:
+            future = self.pending_futures[request_uid]
+            try:
+                if b_response and b_response[0] == _ERROR_RESPONSE_MARKER:
+                    if len(b_response) != 2:
+                        raise RuntimeError("Malformed LMCache RPC error response")
                     error = msgspec_decode(b_response[1], cls=_RemoteErrorPayload)
-                except Exception:
                     future.set_exception(
-                        RuntimeError("Failed to decode LMCache RPC error response")
+                        RemoteHandlerError(
+                            request_type=request_type,
+                            error_type=error.error_type,
+                            message=error.message,
+                        )
                     )
-                    logger.exception("Failed to decode RPC error response")
-                    return
-                future.set_exception(
-                    RemoteHandlerError(
-                        request_type=request_type,
-                        error_type=error.error_type,
-                        message=error.message,
-                    )
+                elif b_response:
+                    response = msgspec_decode(b_response[0], cls=response_cls)
+                    future.set_result(response)
+                else:
+                    future.set_result(None)
+            except Exception as exc:
+                # A response proves the remote transport is finished even if
+                # this client cannot decode it. Resolve the future with the
+                # decode error instead of dropping its only tracking entry and
+                # leaving it permanently unresolved.
+                future.set_exception(exc)
+                logger.exception(
+                    "Failed to decode LMCache MQ response for request_uid=%d",
+                    request_uid,
                 )
-            elif b_response:
-                response = msgspec_decode(b_response[0], cls=response_cls)
-                future.set_result(response)
-            else:
-                future.set_result(None)
+            finally:
+                future.complete_transport()
+                self.pending_futures.pop(request_uid, None)
+                self._inflight_ownership.pop(request_uid, None)
 
     def submit_request(
         self,
@@ -729,22 +804,29 @@ class MessageQueueClient:
         future: MessagingFuture[T] = MessagingFuture(
             on_timeout=self._polling_loop.notify
         )
+        # Detach the complete built-in container graph before leasing or
+        # encoding it. The polling thread and immutable export tuple then refer
+        # to the same private snapshot even if the caller clears/reorders a
+        # payload list while send_multipart accepts the already-encoded frames.
+        transport_payloads = _snapshot_request_payloads(request_payloads)
+        ipc_exports = snapshot_ipc_exports(transport_payloads)
         # Lease at submission—not later in the polling thread. A forwarding
         # handler may return immediately after enqueueing; its finally-cleanup
         # must not release wrappers before this request is serialized.
-        ipc_lease = acquire_ipc_export_lease(request_payloads)
+        ipc_lease = acquire_ipc_export_lease(ipc_exports)
+        ipc_ownership = _IPCTransportOwnership(ipc_exports, ipc_lease)
         try:
             self.input_queue.put(
                 MessageQueueClient.WrappedRequest(
                     request_uid=request_uid,
                     future=future,
                     request_type=request_type,
-                    request_payloads=request_payloads,
-                    ipc_lease=ipc_lease,
+                    request_payloads=transport_payloads,
+                    ipc_ownership=ipc_ownership,
                 )
             )
         except BaseException:
-            release_ipc_exports(request_payloads)
+            release_ipc_exports(ipc_exports)
             ipc_lease.release()
             raise
         self._polling_loop.notify()
@@ -780,25 +862,25 @@ class MessageQueueClient:
         are retained in a process-lifetime quarantine. Only requests still in
         ``input_queue`` are known unsent and may be released.
         """
-        inflight_payloads = getattr(self, "_inflight_payloads", {})
+        inflight_ownership = getattr(self, "_inflight_ownership", {})
         sent_futures = list(self.pending_futures.items())
         for request_uid, future in sent_futures:
-            payloads = inflight_payloads.get(request_uid)
-            if payloads is not None:
-                _quarantine_sent_unanswered_ipc_exports(payloads)
+            ownership = inflight_ownership.get(request_uid)
+            if ownership is not None:
+                _quarantine_sent_unanswered_ipc_exports(ownership)
             retained = future.quarantine_transport_resources()
             if retained:
                 _quarantine_sent_unanswered_ipc_exports(retained)
         self.pending_futures.clear()
-        inflight_payloads.clear()
+        inflight_ownership.clear()
         unsent_futures: list[MessagingFuture[Any]] = []
         while True:
             try:
                 wrapped_request = self.input_queue.get_nowait()
             except queue.Empty:
                 break
-            release_ipc_exports(wrapped_request.request_payloads)
-            wrapped_request.ipc_lease.release()
+            release_ipc_exports(wrapped_request.ipc_ownership.exports)
+            wrapped_request.ipc_ownership.lease.release()
             unsent_futures.append(wrapped_request.future)
         for _request_uid, future in sent_futures:
             future.set_exception(ConnectionError(message))
@@ -1081,13 +1163,29 @@ class MessageQueueServer:
             # Process the incoming requests
             if inbound_state and inbound_state & zmq.POLLIN:
                 msg = self.socket.recv_multipart()
-                assert len(msg) >= 3, (
-                    "Expected at least 3 message parts "
-                    "[identity, request_uid, request_type, *payloads]"
-                )
+                if len(msg) < 3:
+                    logger.error(
+                        "Malformed MQ request: expected at least 3 frames "
+                        "[identity, request_uid, request_type, *payloads], got %d",
+                        len(msg),
+                    )
+                    continue
 
                 identity, b_request_uid, b_request_type, *payloads = msg
-                request_type = msgspec_decode(b_request_type, cls=RequestType)
+                try:
+                    request_type = msgspec_decode(b_request_type, cls=RequestType)
+                except Exception as exc:
+                    # Version skew can make a newer enum value unknown to this
+                    # daemon. The sender already transferred every IPC frame
+                    # after ZeroMQ accepted the multipart message, so routing
+                    # rejection must still materialize/release them exactly
+                    # once and must not terminate the serving loop.
+                    logger.exception("Cannot decode LMCache MQ request type")
+                    _decode_and_release_known_wire_payloads(payloads, [])
+                    self._queue_error_response(
+                        [identity, b_request_uid, b_request_type], exc
+                    )
+                    continue
 
                 if handler_entry := self.handlers.get(request_type):
                     try:
@@ -1106,9 +1204,7 @@ class MessageQueueServer:
                         "No handler registered for request type %s", request_type
                     )
                     logger.error("Available handlers: %s", list(self.handlers.keys()))
-                    _decode_and_release_known_wire_payloads(
-                        payloads, get_payload_classes(request_type)
-                    )
+                    _decode_and_release_known_wire_payloads(payloads, [])
                     self._queue_error_response(
                         [identity, b_request_uid, b_request_type],
                         RuntimeError(

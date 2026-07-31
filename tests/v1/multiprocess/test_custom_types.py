@@ -15,6 +15,7 @@ from lmcache.v1.multiprocess.custom_types import (
     get_customized_decoder,
     get_customized_encoder,
 )
+from lmcache.v1.platform.base_ipc_wrapper import release_ipc_exports
 from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
 
 
@@ -77,15 +78,19 @@ def test_cudaipc_wrapper_serialization():
 
     # Encode the wrapper
     encoded = encoder.encode(wrapper)
+    assert wrapper.mark_ipc_export_transferred() is True
 
     # Decode the wrapper
     decoded_wrapper = decoder.decode(encoded)
-    assert isinstance(decoded_wrapper, CudaIPCWrapper), (
-        "Decoded object is not of type CudaIPCWrapper"
-    )
-    assert decoded_wrapper == wrapper, (
-        "Decoded CudaIPCWrapper does not match the original"
-    )
+    try:
+        assert isinstance(decoded_wrapper, CudaIPCWrapper), (
+            "Decoded object is not of type CudaIPCWrapper"
+        )
+        assert decoded_wrapper == wrapper, (
+            "Decoded CudaIPCWrapper does not match the original"
+        )
+    finally:
+        release_ipc_exports(decoded_wrapper)
 
 
 @pytest.mark.skipif(
@@ -105,16 +110,22 @@ def test_cudaipc_wrapper_list_serialization():
 
     # Encode the list of wrappers
     encoded = encoder.encode(wrappers)
+    transfer_results = [wrapper.mark_ipc_export_transferred() for wrapper in wrappers]
+    assert all(transfer_results)
 
     # Decode the list of wrappers
     decoded_wrappers = decoder.decode(encoded)
+    try:
+        assert len(decoded_wrappers) == len(wrappers), (
+            "Decoded list length does not match original"
+        )
 
-    assert len(decoded_wrappers) == len(wrappers), (
-        "Decoded list length does not match original"
-    )
-
-    for original, decoded in zip(wrappers, decoded_wrappers, strict=False):
-        assert original == decoded, "Decoded CudaIPCWrapper does not match the original"
+        for original, decoded in zip(wrappers, decoded_wrappers, strict=False):
+            assert original == decoded, (
+                "Decoded CudaIPCWrapper does not match the original"
+            )
+    finally:
+        release_ipc_exports(decoded_wrappers)
 
 
 def _worker_process_deserialize_and_reconstruct(
@@ -183,6 +194,8 @@ def test_cudaipc_wrapper_multiprocess_serialization():
     # Serialize the wrappers
     encoder = get_customized_encoder(type=list[CudaIPCWrapper])
     encoded_data = encoder.encode(wrappers)
+    transfer_results = [wrapper.mark_ipc_export_transferred() for wrapper in wrappers]
+    assert all(transfer_results)
 
     # Create a queue for results
     result_queue = ctx.Queue()
@@ -299,6 +312,7 @@ def test_cudaipc_wrapper_nonzero_storage_offset():
 
     encoder = get_customized_encoder(type=CudaIPCWrapper)
     encoded = encoder.encode(wrapper)
+    assert wrapper.mark_ipc_export_transferred() is True
 
     result_queue = ctx.Queue()
     process = ctx.Process(

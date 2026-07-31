@@ -14,6 +14,7 @@ import time
 import weakref
 
 # Third Party
+import msgspec
 import pytest
 import torch
 import zmq
@@ -37,7 +38,10 @@ from lmcache.v1.multiprocess.protocol import (
     get_payload_classes,
 )
 from lmcache.v1.multiprocess.server import add_handler_helper
-from lmcache.v1.platform.base_ipc_wrapper import DeviceIPCWrapper
+from lmcache.v1.platform.base_ipc_wrapper import (
+    DeviceIPCWrapper,
+    release_ipc_exports,
+)
 from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
 
 # Test helpers
@@ -134,7 +138,30 @@ class _TrackedIPCWrapper(DeviceIPCWrapper):
         self.release_pending = False
 
 
-def _cuda_wrapper_probe() -> CudaIPCWrapper:
+class _LegacyTrackedIPCWrapper(DeviceIPCWrapper):
+    """Refcounted legacy extension predating the explicit capability probe."""
+
+    def __init__(self) -> None:
+        self.state = "unconsumed"
+        self.release_calls = 0
+        self.transfer_calls = 0
+
+    def release_ipc_export(self) -> bool:
+        if self.state != "unconsumed":
+            return False
+        self.state = "released"
+        self.release_calls += 1
+        return True
+
+    def mark_ipc_export_transferred(self) -> bool:
+        if self.state != "unconsumed":
+            return False
+        self.state = "transferred"
+        self.transfer_calls += 1
+        return True
+
+
+def _cuda_wrapper_probe(*, auto_release: bool = False) -> CudaIPCWrapper:
     wrapper = CudaIPCWrapper.__new__(CudaIPCWrapper)
     wrapper.handle = (
         0,
@@ -151,7 +178,7 @@ def _cuda_wrapper_probe() -> CudaIPCWrapper:
     wrapper.stride = (1,)
     wrapper.storage_offset = 0
     wrapper.device_uuid = "GPU-test"
-    wrapper._initialize_ipc_ownership(auto_release=False)
+    wrapper._initialize_ipc_ownership(auto_release=auto_release)
     return wrapper
 
 
@@ -205,6 +232,21 @@ def test_no_handler_rejection_decodes_and_releases_wire_export(
     release_counter.assert_called_once()
 
 
+def test_rejected_known_slot_schema_mismatch_generically_releases_wire_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CUDA Ext in an old receiver's scalar slot is decoded exactly once."""
+    sender = _cuda_wrapper_probe()
+    release_counter = MagicMock()
+    monkeypatch.setattr(CudaIPCWrapper, "_release_counter", release_counter)
+
+    wire = mq_mod.msgspec_encode(sender, cls=DeviceIPCWrapper)
+    assert sender.mark_ipc_export_transferred() is True
+    mq_mod._decode_and_release_known_wire_payloads([wire], [int])
+
+    release_counter.assert_called_once()
+
+
 def test_server_no_handler_path_releases_transferred_wire_export(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -247,6 +289,48 @@ def test_server_no_handler_path_releases_transferred_wire_export(
     server.poller.poll.side_effect = poll
     server._main_loop()
 
+    release_counter.assert_called_once()
+    server._queue_error_response.assert_called_once()
+
+
+def test_server_unknown_request_type_releases_wire_export_and_stays_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enum version skew is a per-message rejection, not a daemon crash."""
+    sender = _cuda_wrapper_probe()
+    release_counter = MagicMock()
+    monkeypatch.setattr(CudaIPCWrapper, "_release_counter", release_counter)
+    wire = mq_mod.msgspec_encode(sender, cls=DeviceIPCWrapper)
+    assert sender.mark_ipc_export_transferred() is True
+
+    server = MessageQueueServer.__new__(MessageQueueServer)
+    server.socket = MagicMock()
+    server._output_efd = MagicMock()
+    server._output_efd.fileno.return_value = 99
+    server.poller = MagicMock()
+    server.is_finished = threading.Event()
+    server.handlers = {}
+    server._queue_error_response = MagicMock()
+    server.socket.recv_multipart.return_value = [
+        b"identity",
+        mq_mod.msgspec_encode(5, cls=mq_mod.RequestUID),
+        msgspec.msgpack.encode(2**31 - 1),
+        wire,
+    ]
+    poll_count = 0
+
+    def poll(_timeout: int) -> dict[Any, int]:
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count == 1:
+            return {server.socket: zmq.POLLIN}
+        server.is_finished.set()
+        return {}
+
+    server.poller.poll.side_effect = poll
+    server._main_loop()
+
+    assert poll_count == 2
     release_counter.assert_called_once()
     server._queue_error_response.assert_called_once()
 
@@ -1020,6 +1104,43 @@ def test_sent_timeout_stays_pending_until_late_response_is_transport_safe() -> N
         future.result()
 
 
+def test_malformed_success_response_completes_transport_with_decode_error() -> None:
+    """A bad reply cannot leave an unresolved, untracked future/resource."""
+
+    class _TransportResource:
+        pass
+
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.input_queue = queue.Queue()
+    client._request_counter = itertools.count(18)
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    client.socket = MagicMock()
+
+    future: mq_mod.MessagingFuture[Any] = client.submit_request(RequestType.NOOP, [])
+    resource = _TransportResource()
+    resource_ref = weakref.ref(resource)
+    future.retain_until_transport_complete(resource)
+    del resource
+    client.process_outbound_task()
+    assert resource_ref() is not None
+
+    client.socket.recv_multipart.return_value = [
+        mq_mod.msgspec_encode(18, cls=mq_mod.RequestUID),
+        mq_mod.msgspec_encode(RequestType.NOOP, cls=RequestType),
+        msgspec.msgpack.encode({"not": "the expected string"}),
+    ]
+    client.process_inbound()
+    gc.collect()
+
+    assert future.transport_complete
+    assert client.pending_futures == {}
+    assert client._inflight_ownership == {}
+    assert resource_ref() is None
+    with pytest.raises(Exception, match="Expected `str`"):
+        future.result()
+
+
 def test_timeout_before_send_releases_transport_resources_without_sending() -> None:
     """An expired queued request is safe to cancel before the socket sees it."""
 
@@ -1084,6 +1205,113 @@ def test_successful_send_transfers_ipc_export_ownership(
     assert wrapper.release_calls == 0
 
 
+def test_legacy_refcounted_wrapper_participates_without_new_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Old mark/release subclasses fail safe without implementing new hooks."""
+    monkeypatch.setattr(mq_mod, "_SENT_UNANSWERED_IPC_QUARANTINE", [])
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.input_queue = queue.Queue()
+    client._request_counter = itertools.count(26)
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    client.socket = MagicMock()
+    wrapper = _LegacyTrackedIPCWrapper()
+    monkeypatch.setattr(
+        mq_mod, "get_payload_classes", lambda _request_type: [DeviceIPCWrapper]
+    )
+    monkeypatch.setattr(mq_mod, "msgspec_encode", lambda *_args, **_kwargs: b"encoded")
+
+    client.submit_request(RequestType.NOOP, [wrapper])
+    client.process_outbound_task()
+
+    assert wrapper.state == "transferred"
+    assert wrapper.transfer_calls == 1
+    assert wrapper.release_calls == 0
+    assert mq_mod._SENT_UNANSWERED_IPC_QUARANTINE == []
+
+
+def test_caller_payload_mutation_after_send_cannot_hide_encoded_cuda_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wire bookkeeping uses its frozen wrapper tuple, not the caller list."""
+    monkeypatch.setattr(mq_mod, "_SENT_UNANSWERED_IPC_QUARANTINE", [])
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.input_queue = queue.Queue()
+    client._request_counter = itertools.count(27)
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    client.socket = MagicMock()
+    wrapper = _cuda_wrapper_probe(auto_release=True)
+    release_counter = MagicMock()
+    monkeypatch.setattr(CudaIPCWrapper, "_release_counter", release_counter)
+    caller_payloads = [wrapper]
+    monkeypatch.setattr(
+        mq_mod, "get_payload_classes", lambda _request_type: [DeviceIPCWrapper]
+    )
+
+    def accept_and_mutate(*_args: Any, **_kwargs: Any) -> None:
+        caller_payloads.clear()
+
+    client.socket.send_multipart.side_effect = accept_and_mutate
+    client.submit_request(RequestType.NOOP, caller_payloads)
+    client.process_outbound_task()
+
+    assert caller_payloads == []
+    assert wrapper._ipc_state == wrapper._TRANSFERRED
+    assert wrapper._ipc_lease_count == 0
+    assert mq_mod._SENT_UNANSWERED_IPC_QUARANTINE == []
+    wrapper.__del__()
+    release_counter.assert_not_called()
+
+
+def test_ambiguous_discovery_quarantines_full_async_forward_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An early hook failure cannot release an undiscovered accepted export."""
+    monkeypatch.setattr(mq_mod, "_SENT_UNANSWERED_IPC_QUARANTINE", [])
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.input_queue = queue.Queue()
+    client._request_counter = itertools.count(28)
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    client.socket = MagicMock()
+    first = _cuda_wrapper_probe(auto_release=True)
+    second = _cuda_wrapper_probe(auto_release=True)
+    first.handle = (*first.handle[:5], 1, *first.handle[6:])
+    second.handle = (*second.handle[:5], 2, *second.handle[6:])
+    releases: list[int] = []
+    monkeypatch.setattr(
+        CudaIPCWrapper,
+        "_release_counter",
+        lambda self: releases.append(int(self.handle[5])),
+    )
+    monkeypatch.setattr(
+        first,
+        "ipc_export_requires_transfer",
+        lambda: (_ for _ in ()).throw(RuntimeError("early discovery failure")),
+    )
+    monkeypatch.setattr(
+        mq_mod,
+        "get_payload_classes",
+        lambda _request_type: [list[DeviceIPCWrapper]],
+    )
+    caller_payloads = [[first, second]]
+
+    client.submit_request(RequestType.NOOP, caller_payloads)
+    # Model a forwarding handler's finally-cleanup racing the queued sender.
+    release_ipc_exports(caller_payloads)
+    assert first._ipc_release_pending and second._ipc_release_pending
+    client.process_outbound_task()
+
+    assert first._ipc_state == first._QUARANTINED
+    assert second._ipc_state == second._QUARANTINED
+    assert first._ipc_lease_count == 1
+    assert second._ipc_lease_count == 1
+    assert releases == []
+    assert len(mq_mod._SENT_UNANSWERED_IPC_QUARANTINE) == 1
+
+
 def test_healthy_send_response_cycles_do_not_grow_process_quarantine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1127,7 +1355,7 @@ def test_healthy_send_response_cycles_do_not_grow_process_quarantine(
         client.process_inbound()
         assert future.result() == "NOOP_OK"
         assert client.pending_futures == {}
-        assert client._inflight_payloads == {}
+        assert client._inflight_ownership == {}
         assert mq_mod._SENT_UNANSWERED_IPC_QUARANTINE == []
 
 
@@ -1206,11 +1434,11 @@ def test_accepted_send_quarantine_survives_fast_response_and_gc(
     assert client.pending_futures == {24: future}
     assert wrapper.state == "quarantined"
     assert wrapper.release_calls == 0
-    assert wrapper.lease_count == 0
+    assert wrapper.lease_count == 1
     assert len(mq_mod._SENT_UNANSWERED_IPC_QUARANTINE) == 1
 
     # A reply may race immediately after send and removes both pending_futures
-    # and _inflight_payloads. The process quarantine must remain the strong
+    # and _inflight_ownership. The process quarantine must remain the strong
     # producer-allocation owner after every ordinary reference is gone.
     decoded = iter([24, RequestType.NOOP, "NOOP_OK"])
     monkeypatch.setattr(
@@ -1219,7 +1447,7 @@ def test_accepted_send_quarantine_survives_fast_response_and_gc(
     client.socket.recv_multipart.return_value = [b"uid", b"type", b"response"]
     client.process_inbound()
     assert client.pending_futures == {}
-    assert client._inflight_payloads == {}
+    assert client._inflight_ownership == {}
     assert future.result() == "NOOP_OK"
 
     del wrapper, producer, future
@@ -1262,7 +1490,7 @@ def test_accepted_send_quarantines_entire_batch_after_partial_mark_failure(
     assert first.transfer_calls == 1
     assert all(wrapper.state == "quarantined" for wrapper in wrappers)
     assert all(wrapper.release_calls == 0 for wrapper in wrappers)
-    assert all(wrapper.lease_count == 0 for wrapper in wrappers)
+    assert all(wrapper.lease_count == 1 for wrapper in wrappers)
 
 
 def test_reset_after_accepted_send_retains_exact_ambiguous_payload_once(
@@ -1296,11 +1524,12 @@ def test_reset_after_accepted_send_retains_exact_ambiguous_payload_once(
     client.process_outbound_task()
     assert wrapper.state == "transferred"
     assert mq_mod._SENT_UNANSWERED_IPC_QUARANTINE == []
+    ownership = client._inflight_ownership[40]
 
     client._fail_outstanding("transport reset")
     assert len(mq_mod._SENT_UNANSWERED_IPC_QUARANTINE) == 1
-    assert mq_mod._SENT_UNANSWERED_IPC_QUARANTINE[0] is payloads
-    mq_mod._quarantine_sent_unanswered_ipc_exports(payloads)
+    assert mq_mod._SENT_UNANSWERED_IPC_QUARANTINE[0] is ownership
+    mq_mod._quarantine_sent_unanswered_ipc_exports(ownership)
     assert len(mq_mod._SENT_UNANSWERED_IPC_QUARANTINE) == 1
     with pytest.raises(ConnectionError, match="transport reset"):
         future.result()
@@ -1309,7 +1538,7 @@ def test_reset_after_accepted_send_retains_exact_ambiguous_payload_once(
     client._fail_outstanding("transport reset again")
     assert len(mq_mod._SENT_UNANSWERED_IPC_QUARANTINE) == 1
 
-    del wrapper, producer, payloads, future
+    del wrapper, producer, payloads, future, ownership
     gc.collect()
     assert wrapper_ref() is not None
     assert producer_ref() is not None

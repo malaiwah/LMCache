@@ -146,8 +146,21 @@ class DeviceIPCWrapper:
         return False
 
     def ipc_export_requires_transfer(self) -> bool:
-        """Whether this wrapper participates in refcounted transfer claims."""
-        return False
+        """Whether this wrapper participates in refcounted transfer claims.
+
+        Older third-party wrappers implemented the original public
+        ``release_ipc_export`` / ``mark_ipc_export_transferred`` contract but
+        predate this explicit capability probe. Infer participation whenever
+        either legacy hook is overridden. A release-only legacy wrapper then
+        fails closed at strict commit (safe quarantine) instead of being
+        silently treated as a non-refcounted export.
+        """
+        wrapper_type = type(self)
+        return (
+            wrapper_type.release_ipc_export is not DeviceIPCWrapper.release_ipc_export
+            or wrapper_type.mark_ipc_export_transferred
+            is not DeviceIPCWrapper.mark_ipc_export_transferred
+        )
 
     def ipc_export_transfer_guard(self) -> ContextManager[Any]:
         """Return the lock/context guarding transfer validation and commit."""
@@ -252,6 +265,17 @@ def _unique_ipc_wrappers(value: Any) -> Iterator[DeviceIPCWrapper]:
         yield wrapper
 
 
+def snapshot_ipc_exports(value: Any) -> tuple[DeviceIPCWrapper, ...]:
+    """Capture an identity-deduplicated immutable ownership snapshot.
+
+    Transport code must use the returned tuple for every later ownership
+    action. Re-walking a caller-owned mutable payload after wire encoding can
+    otherwise miss an export removed between ``send_multipart`` acceptance and
+    transfer bookkeeping.
+    """
+    return tuple(_unique_ipc_wrappers(value))
+
+
 class IPCExportLease:
     """Explicit lifetime pin for asynchronously forwarded IPC exports.
 
@@ -304,7 +328,7 @@ def acquire_ipc_export_lease(value: Any) -> IPCExportLease:
     """
     acquired: list[DeviceIPCWrapper] = []
     try:
-        for wrapper in _unique_ipc_wrappers(value):
+        for wrapper in snapshot_ipc_exports(value):
             if wrapper.acquire_ipc_export_lease():
                 acquired.append(wrapper)
     except BaseException:
@@ -378,15 +402,16 @@ def mark_ipc_exports_transferred_strict(value: Any) -> bool:
     # therefore a noexcept boundary: propagating even an exotic wrapper/guard
     # failure would route the caller through ordinary pre-send cleanup and
     # could double-decrement a reservation now visible to the receiver.
-    discovered: list[DeviceIPCWrapper] = []
+    wrappers: list[DeviceIPCWrapper] = []
     participants: list[DeviceIPCWrapper] = []
     try:
-        for wrapper in _unique_ipc_wrappers(value):
-            # Record the wrapper before invoking extension code so an
-            # exception in ipc_export_requires_transfer() can still quarantine
-            # the object locally.  The MQ layer additionally retains the full
-            # payload process-lifetime whenever this function returns False.
-            discovered.append(wrapper)
+        # Snapshot the complete identity set before invoking the first wrapper
+        # extension hook. If discovery fails on wrapper N, every later wrapper
+        # still needs quarantine: releasing its async lease after an accepted
+        # send could otherwise honor deferred cleanup and decrement a live wire
+        # reservation.
+        wrappers.extend(snapshot_ipc_exports(value))
+        for wrapper in wrappers:
             if wrapper.ipc_export_requires_transfer():
                 participants.append(wrapper)
         participants.sort(key=id)
@@ -408,13 +433,13 @@ def mark_ipc_exports_transferred_strict(value: Any) -> bool:
             logger.exception(
                 "Accepted IPC send had ambiguous ownership bookkeeping; "
                 "quarantining %d wrapper(s)",
-                len(discovered),
+                len(wrappers),
             )
         except BaseException:
             # Logging must not turn the post-send noexcept boundary back into
             # an exception path during interpreter or logger teardown.
             pass
-        for wrapper in discovered:
+        for wrapper in wrappers:
             try:
                 wrapper.quarantine_ipc_export_after_send()
             except BaseException:
