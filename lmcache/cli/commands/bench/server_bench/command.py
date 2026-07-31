@@ -545,13 +545,18 @@ def run_server_bench(
         shm_names: list[str] = []
         if use_gpu:
             # First Party
+            from lmcache.v1.platform.base_ipc_wrapper import (
+                wrap_ipc_tensors_rollback_safe,
+            )
             from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
 
             allocated = _allocate_gpu_kv_cache(groups=layer_groups)
             log(
                 "Allocated %d GPU tensors on %s" % (len(allocated), allocated[0].device)
             )
-            kv_wrappers: KVCache = [CudaIPCWrapper(t) for t in allocated]
+            kv_wrappers: KVCache = wrap_ipc_tensors_rollback_safe(
+                allocated, CudaIPCWrapper
+            )
             # Keep the CUDA tensors alive for the lifetime of the
             # bench process -- storage may be reclaimed otherwise --
             # and reuse the same list as the client-side data-mode

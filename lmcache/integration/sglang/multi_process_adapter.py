@@ -36,6 +36,7 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import RequestType
+from lmcache.v1.platform.base_ipc_wrapper import wrap_ipc_tensors_rollback_safe
 from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
 
 logger = init_logger(__name__)
@@ -56,10 +57,9 @@ def _wrap_sglang_kv_caches(
     ``EngineType.SGLANG`` plus a ``tokens_per_block`` ``LayoutHints`` field
     and splits it back at its midpoint before format detection.
     """
-    wrapped: KVCache = []
-    wrapped.extend(CudaIPCWrapper(tensor) for tensor in k_pool)
-    wrapped.extend(CudaIPCWrapper(tensor) for tensor in v_pool)
-    return wrapped
+    # Each completed _share_cuda_ owns one producer reservation. Roll back a
+    # partial K/V batch if a later wrapper fails to construct.
+    return wrap_ipc_tensors_rollback_safe((*k_pool, *v_pool), CudaIPCWrapper)  # type: ignore[return-value]
 
 
 @dataclass

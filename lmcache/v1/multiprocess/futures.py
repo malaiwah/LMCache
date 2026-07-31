@@ -114,6 +114,22 @@ class MessagingFuture(Generic[T]):
         transport_resources.clear()
         return True
 
+    def quarantine_transport_resources(self) -> list[Any]:
+        """Detach sent-unanswered resources without destroying them.
+
+        A transport reset has no remote cancellation acknowledgement. The MQ
+        layer moves the returned objects into its process-lifetime quarantine
+        so producer-side CUDA resources cannot be freed under a daemon that
+        may still consume the accepted message.
+        """
+        with self._completion_lock:
+            if self._transport_complete:
+                return []
+            self._transport_complete = True
+            transport_resources = self._transport_resources
+            self._transport_resources = []
+            return transport_resources
+
     def set_result(self, result: T) -> None:
         """
         Set the result of the future and mark it as done. This function is NOT

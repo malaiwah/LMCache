@@ -3,10 +3,9 @@
 """Unit tests for the device-type-driven dispatch in
 ``lmcache.v1.platform.cache_context.create_cache_context``.
 
-The facade routes built-in wrappers by class-level ``device_type`` metadata,
-with a ``to_tensor().device.type`` fallback for legacy third-party wrappers,
-then looks up the registered context class. These tests exercise both paths
-without touching CUDA or the real ``GPUCacheContext`` / ``CPUCacheContext``
+The facade routes wrappers by non-consuming class-level ``device_type``
+metadata and rejects legacy wrappers that would need a one-shot ``to_tensor``
+probe. These tests exercise both paths without touching CUDA or real context
 constructors.
 """
 
@@ -23,18 +22,20 @@ from lmcache.v1.platform.base_cache_context import BaseCacheContext
 from lmcache.v1.platform.cache_context import create_cache_context
 
 
-class _FakeWrapper:
-    """Legacy stand-in without class-level device metadata.
-
-    A 0-byte tensor on the requested device exercises the compatibility
-    fallback used for third-party wrappers.
-    """
-
-    def __init__(self, device_type: str) -> None:
-        self._device_type = device_type
+class _FakeCPUWrapper:
+    device_type = "cpu"
 
     def to_tensor(self) -> torch.Tensor:
-        return torch.empty(0, device=torch.device(self._device_type))
+        raise AssertionError("device detection must be non-consuming")
+
+
+class _FakeCUDAWrapper(_FakeCPUWrapper):
+    device_type = "cuda"
+
+
+class _LegacyWrapper:
+    def to_tensor(self) -> torch.Tensor:
+        raise AssertionError("legacy one-shot wrapper must not be consumed")
 
 
 class _DeclaredWrapper:
@@ -158,7 +159,7 @@ def test_dispatches_by_cpu_device_type(isolated_registry: None) -> None:
     class."""
     _install(cpu=_FakeCPUContext)
 
-    wrappers: List[_FakeWrapper] = [_FakeWrapper("cpu"), _FakeWrapper("cpu")]
+    wrappers: List[_FakeCPUWrapper] = [_FakeCPUWrapper(), _FakeCPUWrapper()]
     ctx = create_cache_context(wrappers)  # type: ignore[arg-type]
 
     assert isinstance(ctx, _FakeCPUContext)
@@ -185,7 +186,7 @@ def test_dispatches_by_cuda_device_type(isolated_registry: None) -> None:
         pytest.skip("CUDA not available")
     _install(cuda=_FakeCUDAContext)
 
-    wrappers = [_FakeWrapper("cuda")]
+    wrappers = [_FakeCUDAWrapper()]
     ctx = create_cache_context(wrappers, lmcache_tokens_per_chunk=128)  # type: ignore[arg-type]
 
     assert isinstance(ctx, _FakeCUDAContext)
@@ -203,13 +204,20 @@ def test_mixed_device_types_raises(isolated_registry: None) -> None:
         pytest.skip("CUDA not available")
     _install(cpu=_FakeCPUContext, cuda=_FakeCUDAContext)
 
-    wrappers = [_FakeWrapper("cpu"), _FakeWrapper("cuda")]
+    wrappers = [_FakeCPUWrapper(), _FakeCUDAWrapper()]
     with pytest.raises(ValueError, match="share one"):
         create_cache_context(wrappers)  # type: ignore[arg-type]
 
 
 def test_unregistered_device_type_raises(isolated_registry: None) -> None:
     """An unknown device type is a hard failure with a clear hint."""
-    wrappers = [_FakeWrapper("cpu")]
+    wrappers = [_FakeCPUWrapper()]
     with pytest.raises(ValueError, match="No cache-context class"):
         create_cache_context(wrappers)  # type: ignore[arg-type]
+
+
+def test_legacy_wrapper_without_device_metadata_is_rejected(
+    isolated_registry: None,
+) -> None:
+    with pytest.raises(TypeError, match="to_tensor.*unsafe"):
+        create_cache_context([_LegacyWrapper()])  # type: ignore[list-item]

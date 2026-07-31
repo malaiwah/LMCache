@@ -18,6 +18,7 @@ from __future__ import annotations
 
 # Standard
 from typing import Any, ClassVar, cast
+import pickle
 import threading
 
 # Third Party
@@ -44,9 +45,21 @@ class CudaIPCWrapper(DeviceIPCWrapper):
     #: constant so external tooling / tests can introspect the binding.
     device_type: ClassVar[str] = "cuda"
     _UNCONSUMED: ClassVar[str] = "unconsumed"
+    _INITIALIZING: ClassVar[str] = "initializing"
+    _SERIALIZING: ClassVar[str] = "serializing"
+    _ENCODED: ClassVar[str] = "encoded"
+    _NATIVE_IMPORTING: ClassVar[str] = "native_importing"
     _IMPORTED: ClassVar[str] = "imported"
     _RELEASED: ClassVar[str] = "released"
     _TRANSFERRED: ClassVar[str] = "transferred"
+    _QUARANTINED: ClassVar[str] = "quarantined"
+
+    _ipc_state_lock: Any
+    _cached_tensor: torch.Tensor | None
+    _producer_tensor: torch.Tensor | None
+    _ipc_lease_count: int
+    _ipc_release_pending: bool
+    _auto_release: bool
 
     @classmethod
     def wrap(cls, tensor: torch.Tensor) -> "CudaIPCWrapper":
@@ -68,17 +81,26 @@ class CudaIPCWrapper(DeviceIPCWrapper):
             attempt_permute_to_contiguous_view,
         )
 
-        # Permute any non-contiguous view (e.g. vLLM's NHD-over-HND) so the
-        # shape/stride we encode across IPC reflects the physical layout.
-        # Offset is preserved by the wrapper's storage_offset field.
-        tensor = cast(torch.Tensor, attempt_permute_to_contiguous_view(tensor))
-
-        storage = tensor.untyped_storage()
-        handle = storage._share_cuda_()
-
-        self.handle = handle
-        self._initialize_ipc_ownership(auto_release=False)
+        # Establish destructor-safe state before any step can raise.  The
+        # reservation only becomes releasable after _share_cuda_ returns and
+        # the handle is installed below.
+        self._initialize_ipc_ownership(
+            auto_release=True, initial_state=self._INITIALIZING
+        )
         try:
+            # Permute any non-contiguous view (e.g. vLLM's NHD-over-HND) so
+            # shape/stride describe the physical layout on the wire.
+            tensor = cast(torch.Tensor, attempt_permute_to_contiguous_view(tensor))
+            storage = tensor.untyped_storage()
+            handle = storage._share_cuda_()
+
+            with self._ipc_state_lock:
+                self.handle = handle
+                # Keep the exporting allocation alive at least as long as this
+                # wrapper/transport quarantine is retained.
+                self._producer_tensor = tensor
+                self._ipc_state = self._UNCONSUMED
+
             self.dtype = tensor.dtype
             self.shape = tuple(tensor.shape)
             self.stride = tuple(tensor.stride())
@@ -87,28 +109,38 @@ class CudaIPCWrapper(DeviceIPCWrapper):
             device_index = tensor.device.index
             self.device_uuid = self._get_device_uuid(device_index)
         except BaseException:
-            # Once _share_cuda_ succeeds, this constructor owns one producer
-            # reservation even if later metadata discovery fails.
+            # If _share_cuda_ succeeded, release_ipc_export observes
+            # UNCONSUMED and rolls the reservation back.  Earlier failures see
+            # INITIALIZING and are a no-op.
             self.release_ipc_export()
             raise
 
-    def _initialize_ipc_ownership(self, *, auto_release: bool) -> None:
+    def _initialize_ipc_ownership(
+        self,
+        *,
+        auto_release: bool,
+        initial_state: str | None = None,
+    ) -> None:
         """Initialize process-local state excluded from the wire payload."""
-        self._ipc_state = self._UNCONSUMED
-        self._ipc_state_lock = threading.Lock()
-        self._cached_tensor: torch.Tensor | None = None
+        self._ipc_state = initial_state or self._UNCONSUMED
+        self._ipc_state_lock = threading.RLock()
+        self._cached_tensor = None
+        self._producer_tensor = None
+        self._ipc_lease_count = 0
+        self._ipc_release_pending = False
         # A deserialized receiver owns the reservation and must release it if
         # the handler never imports it. The sender transfers ownership only
         # after the atomic transport send succeeds.
         self._auto_release = auto_release
 
     def __getstate__(self) -> dict[str, Any]:
-        """Serialize only the CUDA handle metadata, never local ownership state."""
+        """Return metadata only inside the managed one-shot serializer."""
         with self._ipc_state_lock:
-            if self._ipc_state != self._UNCONSUMED:
+            if self._ipc_state != self._SERIALIZING:
                 raise RuntimeError(
-                    "Cannot serialize a CUDA IPC wrapper after its export was "
-                    f"{self._ipc_state}"
+                    "CUDA IPC wrappers must be encoded through "
+                    "DeviceIPCWrapper.Serialize exactly once "
+                    f"(state={self._ipc_state})"
                 )
             return {
                 "handle": self.handle,
@@ -119,39 +151,66 @@ class CudaIPCWrapper(DeviceIPCWrapper):
                 "device_uuid": self.device_uuid,
             }
 
+    def _serialize_for_wire(self) -> bytes:
+        """Claim and encode this reservation exactly once.
+
+        The re-entrant state lock spans ``pickle.dumps``.  Release and encode
+        therefore have a single atomic winner, and a duplicate object in one
+        payload (or a repeated encode) is rejected before another wire owner
+        can be created.
+        """
+        try:
+            with self._ipc_state_lock:
+                if self._ipc_state != self._UNCONSUMED:
+                    raise RuntimeError(
+                        "Cannot serialize a CUDA IPC wrapper more than once "
+                        f"(state={self._ipc_state})"
+                    )
+                self._ipc_state = self._SERIALIZING
+                encoded = pickle.dumps(self)
+                self._ipc_state = self._ENCODED
+                return encoded
+        except BaseException:
+            should_release = False
+            with self._ipc_state_lock:
+                # A duplicate/repeated call never owned the active reservation
+                # and must not release bytes produced by the first encoder.
+                if self._ipc_state == self._SERIALIZING:
+                    should_release = True
+                    self._ipc_state = self._RELEASED
+                    self._auto_release = False
+            if should_release:
+                self._release_counter_noexcept()
+            raise
+
     def __setstate__(self, state: dict[str, Any]) -> None:
         """Restore wire metadata and make this process the reservation owner."""
-        self.handle = state["handle"]
-        self.dtype = state["dtype"]
-        self.shape = state["shape"]
-        self.stride = state["stride"]
-        self.storage_offset = state["storage_offset"]
-        self.device_uuid = state["device_uuid"]
-        self._initialize_ipc_ownership(auto_release=True)
-
-    def _import_tensor_from_handle(self) -> torch.Tensor:
-        """Import the one consumer storage represented by this wrapper."""
-        storage: torch.UntypedStorage | None = None
+        self._initialize_ipc_ownership(
+            auto_release=True, initial_state=self._INITIALIZING
+        )
         try:
-            device_index = self._get_device_index_from_uuid(self.device_uuid)
-            # Allocate the tensor shell before opening the shared storage. If
-            # either step fails before ``storage`` is assigned, no storage
-            # deleter exists and we must return the reservation explicitly.
-            tensor = torch.empty(
-                (), device=f"{torch_device_type}:{device_index}", dtype=self.dtype
-            )
-            storage = self._open_shared_storage(device_index)
-            tensor.set_(storage, self.storage_offset, self.shape, self.stride)
-            return tensor
+            with self._ipc_state_lock:
+                self.handle = state["handle"]
+                self._ipc_state = self._UNCONSUMED
+            self.dtype = state["dtype"]
+            self.shape = state["shape"]
+            self.stride = state["stride"]
+            self.storage_offset = state["storage_offset"]
+            self.device_uuid = state["device_uuid"]
         except BaseException:
-            if storage is None:
-                self._release_counter_noexcept()
-            # Once storage exists, its deleter owns the one decrement even if
-            # rebuilding the tensor view fails.
+            self.release_ipc_export()
             raise
 
     def _open_shared_storage(self, device_index: int) -> torch.UntypedStorage:
-        """Open the CUDA storage and attach its consumer-side refcounter."""
+        """Cross the native ownership boundary and build consumer storage.
+
+        At function entry the Python wrapper relinquishes the right to call
+        ``_release_ipc_counter_cuda``.  PyTorch may create a refcounted
+        ``DataPtr`` and then throw while constructing ``StorageImpl``; its C++
+        RAII deleter would already perform the decrement.  Consequently any
+        exception from this call is conservatively quarantined rather than
+        explicitly decremented a second time.
+        """
         return torch.UntypedStorage._new_shared_cuda(  # noqa: SLF001
             device_index, *self.handle[1:]
         )
@@ -198,11 +257,36 @@ class CudaIPCWrapper(DeviceIPCWrapper):
                     f"(state={self._ipc_state})"
                 )
 
+            # All fallible Python validation happens while this process still
+            # owns the explicit release right.
             try:
-                tensor = self._import_tensor_from_handle()
+                device_index = self._get_device_index_from_uuid(self.device_uuid)
+                tensor = torch.empty(
+                    (),
+                    device=f"{torch_device_type}:{device_index}",
+                    dtype=self.dtype,
+                )
             except BaseException:
-                # _import_tensor_from_handle either returned the reservation
-                # explicitly or attached it to a storage deleter.
+                self._ipc_state = self._RELEASED
+                self._auto_release = False
+                self._release_counter_noexcept()
+                raise
+
+            # The native boundary is intentionally one-way.  Never explicitly
+            # release after entering it: on a mid-construction exception C++
+            # RAII may already own the sole decrement.
+            self._ipc_state = self._NATIVE_IMPORTING
+            self._auto_release = False
+            try:
+                storage = self._open_shared_storage(device_index)
+            except BaseException:
+                self._ipc_state = self._QUARANTINED
+                raise
+
+            try:
+                tensor.set_(storage, self.storage_offset, self.shape, self.stride)
+            except BaseException:
+                # ``storage`` owns the decrement and releases it when unwound.
                 self._ipc_state = self._RELEASED
                 raise
 
@@ -217,12 +301,19 @@ class CudaIPCWrapper(DeviceIPCWrapper):
             ``True`` for the call that claimed the reservation; ``False`` if
             another terminal action already won.
         """
+        should_release = False
         with self._ipc_state_lock:
-            if self._ipc_state != self._UNCONSUMED:
+            if self._ipc_state not in (self._UNCONSUMED, self._ENCODED):
+                return False
+            if self._ipc_lease_count:
+                self._ipc_release_pending = True
                 return False
             self._ipc_state = self._RELEASED
+            self._auto_release = False
+            should_release = True
+        if should_release:
             self._release_counter_noexcept()
-            return True
+        return should_release
 
     def mark_ipc_export_transferred(self) -> bool:
         """Relinquish this process's copy after a successful transport send.
@@ -232,11 +323,62 @@ class CudaIPCWrapper(DeviceIPCWrapper):
             another terminal action already won.
         """
         with self._ipc_state_lock:
-            if self._ipc_state != self._UNCONSUMED:
+            if self._ipc_state != self._ENCODED:
                 return False
             self._ipc_state = self._TRANSFERRED
+            self._ipc_release_pending = False
             self._auto_release = False
             return True
+
+    def ipc_export_requires_transfer(self) -> bool:
+        return True
+
+    def ipc_export_transfer_guard(self) -> Any:
+        return self._ipc_state_lock
+
+    def validate_ipc_export_transfer(self) -> None:
+        if self._ipc_state != self._ENCODED:
+            raise RuntimeError(
+                "CUDA IPC export was accepted by transport before a unique "
+                f"encoding claim was ready (state={self._ipc_state})"
+            )
+
+    def quarantine_ipc_export_after_send(self) -> None:
+        # Caller holds ipc_export_transfer_guard across the batch. RLock keeps
+        # this safe if the method is also used directly in a diagnostic path.
+        with self._ipc_state_lock:
+            self._ipc_state = self._QUARANTINED
+            self._ipc_release_pending = False
+            self._auto_release = False
+
+    def acquire_ipc_export_lease(self) -> bool:
+        """Pin an unencoded reservation for asynchronous transport."""
+        with self._ipc_state_lock:
+            if self._ipc_state != self._UNCONSUMED:
+                raise RuntimeError(
+                    f"Cannot lease CUDA IPC export in state {self._ipc_state}"
+                )
+            self._ipc_lease_count += 1
+            return True
+
+    def release_ipc_export_lease(self) -> None:
+        """Drop one transport lease and honor deferred cleanup."""
+        should_release = False
+        with self._ipc_state_lock:
+            if self._ipc_lease_count <= 0:
+                raise RuntimeError("CUDA IPC export lease underflow")
+            self._ipc_lease_count -= 1
+            if (
+                self._ipc_lease_count == 0
+                and self._ipc_release_pending
+                and self._ipc_state in (self._UNCONSUMED, self._ENCODED)
+            ):
+                self._ipc_state = self._RELEASED
+                self._ipc_release_pending = False
+                self._auto_release = False
+                should_release = True
+        if should_release:
+            self._release_counter_noexcept()
 
     def __del__(self) -> None:
         """Best-effort fallback for a receiver that never consumed its handle."""

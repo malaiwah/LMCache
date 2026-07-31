@@ -19,7 +19,8 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Iterator
-from typing import Any, Tuple
+from contextlib import ExitStack, nullcontext
+from typing import Any, ContextManager, Tuple
 import pickle
 import threading
 
@@ -144,6 +145,35 @@ class DeviceIPCWrapper:
         """
         return False
 
+    def ipc_export_requires_transfer(self) -> bool:
+        """Whether this wrapper participates in refcounted transfer claims."""
+        return False
+
+    def ipc_export_transfer_guard(self) -> ContextManager[Any]:
+        """Return the lock/context guarding transfer validation and commit."""
+        return nullcontext()
+
+    def validate_ipc_export_transfer(self) -> None:
+        """Raise unless a post-send ownership transfer can be committed."""
+
+    def quarantine_ipc_export_after_send(self) -> None:
+        """Prevent release after an accepted send with ambiguous bookkeeping."""
+
+    def acquire_ipc_export_lease(self) -> bool:
+        """Pin a one-shot export while asynchronous code takes ownership.
+
+        Refcounted transports override this method.  A successful lease keeps
+        handler-finally cleanup from releasing the reservation before an
+        asynchronous sender has serialized and either sent or rejected it.
+
+        Returns:
+            ``True`` when this wrapper acquired a lease.
+        """
+        return False
+
+    def release_ipc_export_lease(self) -> None:
+        """Release one lease acquired by :meth:`acquire_ipc_export_lease`."""
+
     def __eq__(self, other: object) -> bool:
         # ``isinstance`` first so type-checkers can narrow ``other`` to
         # ``DeviceIPCWrapper`` before we touch its attributes; the
@@ -178,6 +208,9 @@ class DeviceIPCWrapper:
         Returns:
             The pickled bytes payload.
         """
+        serialize_for_wire = getattr(obj, "_serialize_for_wire", None)
+        if serialize_for_wire is not None:
+            return serialize_for_wire()
         return pickle.dumps(obj)
 
     @staticmethod
@@ -208,13 +241,99 @@ def _walk_ipc_wrappers(value: Any) -> Iterator[DeviceIPCWrapper]:
             yield from _walk_ipc_wrappers(item)
 
 
+def _unique_ipc_wrappers(value: Any) -> Iterator[DeviceIPCWrapper]:
+    """Yield each wrapper identity once, preserving traversal order."""
+    seen: set[int] = set()
+    for wrapper in _walk_ipc_wrappers(value):
+        identity = id(wrapper)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        yield wrapper
+
+
+class IPCExportLease:
+    """Explicit lifetime pin for asynchronously forwarded IPC exports.
+
+    Callers must retain this object until the queued transport has either
+    transferred or rejected every wrapper.  ``release`` is idempotent, and a
+    destructor fallback prevents an abandoned pre-send lease from stranding a
+    reservation indefinitely.
+    """
+
+    def __init__(self, wrappers: tuple[DeviceIPCWrapper, ...]) -> None:
+        self._wrappers = wrappers
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        """Drop every wrapper lease exactly once."""
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+            wrappers = self._wrappers
+            self._wrappers = ()
+        for wrapper in reversed(wrappers):
+            try:
+                wrapper.release_ipc_export_lease()
+            except Exception:
+                logger.exception(
+                    "Failed to release IPC export lease for %s",
+                    type(wrapper).__name__,
+                )
+
+    def __enter__(self) -> "IPCExportLease":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
+
+    def __del__(self) -> None:
+        try:
+            self.release()
+        except BaseException:
+            pass
+
+
+def acquire_ipc_export_lease(value: Any) -> IPCExportLease:
+    """Atomically lease all refcounted wrappers nested in ``value``.
+
+    Partial acquisition is rolled back before propagating an error.  The
+    returned object must stay alive until transport success/failure is known.
+    """
+    acquired: list[DeviceIPCWrapper] = []
+    try:
+        for wrapper in _unique_ipc_wrappers(value):
+            if wrapper.acquire_ipc_export_lease():
+                acquired.append(wrapper)
+    except BaseException:
+        IPCExportLease(tuple(acquired)).release()
+        raise
+    return IPCExportLease(tuple(acquired))
+
+
+def wrap_ipc_tensors_rollback_safe(
+    tensors: Any, wrapper_factory: Any
+) -> list[DeviceIPCWrapper]:
+    """Build an IPC wrapper batch and release a partial batch on failure."""
+    wrappers: list[DeviceIPCWrapper] = []
+    try:
+        for tensor in tensors:
+            wrappers.append(wrapper_factory(tensor))
+    except BaseException:
+        release_ipc_exports(wrappers)
+        raise
+    return wrappers
+
+
 def release_ipc_exports(value: Any) -> None:
     """Best-effort release of every unconsumed export nested in a payload.
 
     Args:
         value: A wrapper or protocol container containing wrappers.
     """
-    for wrapper in _walk_ipc_wrappers(value):
+    for wrapper in _unique_ipc_wrappers(value):
         try:
             wrapper.release_ipc_export()
         except Exception:
@@ -231,7 +350,7 @@ def mark_ipc_exports_transferred(value: Any) -> None:
     Args:
         value: A wrapper or protocol container containing wrappers.
     """
-    for wrapper in _walk_ipc_wrappers(value):
+    for wrapper in _unique_ipc_wrappers(value):
         try:
             wrapper.mark_ipc_export_transferred()
         except Exception:
@@ -241,3 +360,70 @@ def mark_ipc_exports_transferred(value: Any) -> None:
                 "Failed to record IPC export transfer for %s",
                 type(wrapper).__name__,
             )
+
+
+def mark_ipc_exports_transferred_strict(value: Any) -> bool:
+    """Atomically commit a refcounted wrapper batch after accepted send.
+
+    All participating wrapper locks are acquired in stable identity order.
+    Validation completes for the entire unique batch before the first state is
+    changed. If validation/commit still fails unexpectedly, every participant
+    is moved to a non-releasable quarantine: the transport already owns the
+    bytes, so leaking until process teardown is safer than a double decrement.
+
+    Returns:
+        ``True`` for a fully recorded transfer, ``False`` for safe quarantine.
+    """
+    # This function runs only *after* an atomic transport send returned.  It is
+    # therefore a noexcept boundary: propagating even an exotic wrapper/guard
+    # failure would route the caller through ordinary pre-send cleanup and
+    # could double-decrement a reservation now visible to the receiver.
+    discovered: list[DeviceIPCWrapper] = []
+    participants: list[DeviceIPCWrapper] = []
+    try:
+        for wrapper in _unique_ipc_wrappers(value):
+            # Record the wrapper before invoking extension code so an
+            # exception in ipc_export_requires_transfer() can still quarantine
+            # the object locally.  The MQ layer additionally retains the full
+            # payload process-lifetime whenever this function returns False.
+            discovered.append(wrapper)
+            if wrapper.ipc_export_requires_transfer():
+                participants.append(wrapper)
+        participants.sort(key=id)
+        if not participants:
+            return True
+
+        with ExitStack() as stack:
+            for wrapper in participants:
+                stack.enter_context(wrapper.ipc_export_transfer_guard())
+            for wrapper in participants:
+                wrapper.validate_ipc_export_transfer()
+            for wrapper in participants:
+                if not wrapper.mark_ipc_export_transferred():
+                    raise RuntimeError(
+                        f"{type(wrapper).__name__} rejected validated transfer"
+                    )
+    except BaseException:
+        try:
+            logger.exception(
+                "Accepted IPC send had ambiguous ownership bookkeeping; "
+                "quarantining %d wrapper(s)",
+                len(discovered),
+            )
+        except BaseException:
+            # Logging must not turn the post-send noexcept boundary back into
+            # an exception path during interpreter or logger teardown.
+            pass
+        for wrapper in discovered:
+            try:
+                wrapper.quarantine_ipc_export_after_send()
+            except BaseException:
+                try:
+                    logger.exception(
+                        "Failed to quarantine accepted IPC export for %s",
+                        type(wrapper).__name__,
+                    )
+                except BaseException:
+                    pass
+        return False
+    return True
