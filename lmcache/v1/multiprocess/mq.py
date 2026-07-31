@@ -773,10 +773,19 @@ class MessageQueueClient:
                 # this client cannot decode it. Resolve the future with the
                 # decode error instead of dropping its only tracking entry and
                 # leaving it permanently unresolved.
-                future.set_exception(exc)
                 logger.exception(
                     "Failed to decode LMCache MQ response for request_uid=%d",
                     request_uid,
+                )
+                # Never store the caught exception itself: its traceback owns
+                # this process_inbound frame, which owns ``self`` and would
+                # keep the complete MessageQueueClient graph alive as long as
+                # callers retain the failed future.
+                future.set_exception(
+                    RuntimeError(
+                        "Failed to decode LMCache MQ response: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
                 )
             finally:
                 future.complete_transport()

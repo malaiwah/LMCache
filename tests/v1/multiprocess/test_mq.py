@@ -1104,7 +1104,9 @@ def test_sent_timeout_stays_pending_until_late_response_is_transport_safe() -> N
         future.result()
 
 
-def test_malformed_success_response_completes_transport_with_decode_error() -> None:
+def test_malformed_success_response_completes_transport_without_client_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A bad reply cannot leave an unresolved, untracked future/resource."""
 
     class _TransportResource:
@@ -1116,6 +1118,10 @@ def test_malformed_success_response_completes_transport_with_decode_error() -> N
     client.pending_futures = {}
     client._polling_loop = MagicMock()
     client.socket = MagicMock()
+    client_ref = weakref.ref(client)
+    # Captured logger traceback records independently retain the frame. The
+    # ownership contract under test is the exception stored by the future.
+    monkeypatch.setattr(mq_mod.logger, "exception", lambda *_args, **_kwargs: None)
 
     future: mq_mod.MessagingFuture[Any] = client.submit_request(RequestType.NOOP, [])
     resource = _TransportResource()
@@ -1137,7 +1143,19 @@ def test_malformed_success_response_completes_transport_with_decode_error() -> N
     assert client.pending_futures == {}
     assert client._inflight_ownership == {}
     assert resource_ref() is None
-    with pytest.raises(Exception, match="Expected `str`"):
+    assert future.exception_ is not None
+    assert future.exception_.__traceback__ is None
+
+    # Retaining the failed future must not retain process_inbound's ``self``.
+    # Check before result() raises (and naturally attaches its caller traceback
+    # to the otherwise sanitized exception).
+    del client
+    gc.collect()
+    assert client_ref() is None
+
+    with pytest.raises(
+        RuntimeError, match="Failed to decode.*ValidationError.*Expected `str`"
+    ):
         future.result()
 
 
