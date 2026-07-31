@@ -9,6 +9,7 @@ one-import-or-one-release contract without opening a GPU handle.
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, cast
 from unittest.mock import MagicMock
+import pickle
 import threading
 import time
 
@@ -340,6 +341,22 @@ def test_serialization_claim_is_one_shot_and_duplicate_safe(
 
     # The rejected duplicate encoder did not steal or release the reservation.
     release_counter.assert_not_called()
+    assert wrapper.release_ipc_export() is True
+    release_counter.assert_called_once()
+
+
+def test_raw_pickle_cannot_bypass_managed_one_shot_serializer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Python spawn/pickle is not a second transport for CUDA exports."""
+    wrapper = _wrapper(receiver=False)
+    release_counter = MagicMock()
+    monkeypatch.setattr(CudaIPCWrapper, "_release_counter", release_counter)
+
+    with pytest.raises(RuntimeError, match="DeviceIPCWrapper.Serialize exactly once"):
+        pickle.dumps(wrapper)
+
+    assert wrapper._ipc_state == wrapper._UNCONSUMED
     assert wrapper.release_ipc_export() is True
     release_counter.assert_called_once()
 

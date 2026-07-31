@@ -458,6 +458,7 @@ def _run_client_test(
     expected_response: Any,
     num_requests: int = 1,
     client_id: int = 0,
+    payload_factory: Callable[[], list[Any]] | None = None,
 ) -> None:
     """
     Client process that sends requests and validates responses.
@@ -470,6 +471,10 @@ def _run_client_test(
         expected_response: Expected response from server
         num_requests: Number of requests to send
         client_id: ID of this client (for debugging)
+        payload_factory: Optional module-level factory invoked inside this
+            spawned client for each request. CUDA IPC wrappers must be created
+            here so their first and only transport is the managed MQ encoder,
+            rather than Python spawn pickling the test-helper arguments.
 
     Returns:
         bool: True if all tests passed, False otherwise
@@ -490,7 +495,8 @@ def _run_client_test(
         futures = []
         # Submit requests
         for _ in range(num_requests):
-            future = client.submit_request(request_type, payloads)  # type: ignore
+            request_payloads = payload_factory() if payload_factory else payloads
+            future = client.submit_request(request_type, request_payloads)  # type: ignore
             futures.append(future)
 
         # Validate responses
@@ -570,6 +576,7 @@ class MessageQueueTestHelper:
         num_requests: int = 1,
         num_clients: int = 1,
         timeout: float = 10.0,
+        payload_factory: Callable[[], list[Any]] | None = None,
     ) -> None:
         """
         Run a test by starting server and client processes.
@@ -581,6 +588,8 @@ class MessageQueueTestHelper:
             num_requests: Number of requests each client should send
             num_clients: Number of client processes to start
             timeout: Maximum time to wait for test completion
+            payload_factory: Optional module-level per-request payload factory
+                executed inside each spawned client.
 
         Raises:
             AssertionError: If test fails
@@ -608,6 +617,7 @@ class MessageQueueTestHelper:
                     expected_response,
                     num_requests,
                     client_id,
+                    payload_factory,
                 ),
             )
             client_process.start()
@@ -707,6 +717,20 @@ def test_mq_noop_multiple_clients():
     )
 
 
+def _make_register_kv_cache_payloads() -> list[Any]:
+    """Create one-shot CUDA exports inside the spawned MQ client process."""
+    kv_cache = [CudaIPCWrapper(torch.randn(2, 4, device="cuda")) for _ in range(3)]
+    return [
+        0,
+        kv_cache,
+        "testmodel",
+        1,
+        EngineType.VLLM,
+        {"vllm_block_size": 16},
+        [],
+    ]
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA is required for REGISTER_KV_CACHE tests",
@@ -716,15 +740,6 @@ def test_mq_register_kv_cache():
     Test MessageQueue with REGISTER_KV_CACHE request type.
     REGISTER_KV_CACHE takes (gpu_id: int, kv_cache: KVCache) and returns None.
     """
-    # Create test KV cache (list of CudaIPCWrapper objects)
-    kv_cache = []
-    for _ in range(3):
-        tensor = torch.randn(2, 4, device="cuda")
-        wrapper = CudaIPCWrapper(tensor)
-        kv_cache.append(wrapper)
-
-    gpu_id = 0
-
     # Create test helper and register handler
     helper = MessageQueueTestHelper(server_url="tcp://127.0.0.1:5559")
     helper.register_handler(
@@ -734,15 +749,8 @@ def test_mq_register_kv_cache():
     # Run test with REGISTER_KV_CACHE request
     helper.run_test(
         request_type=RequestType.REGISTER_KV_CACHE,
-        payloads=[
-            gpu_id,
-            kv_cache,
-            "testmodel",
-            1,
-            EngineType.VLLM,
-            {"vllm_block_size": 16},
-            [],
-        ],
+        payloads=[],
+        payload_factory=_make_register_kv_cache_payloads,
         expected_response=None,
         num_requests=1,
     )
