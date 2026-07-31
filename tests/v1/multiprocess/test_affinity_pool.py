@@ -246,3 +246,51 @@ def test_shutdown_no_wait():
     pool.submit(lambda: time.sleep(0.5), affinity_key=0)
     # Should return immediately without waiting
     pool.shutdown(wait=False)
+
+
+def test_shutdown_cancels_queued_work_and_drains_active_work() -> None:
+    """Shutdown never starts queued GPU work after teardown begins."""
+    pool = AffinityThreadPool(max_workers=1)
+    active_started = threading.Event()
+    release_active = threading.Event()
+
+    def block() -> str:
+        active_started.set()
+        assert release_active.wait(timeout=5)
+        return "active-finished"
+
+    active = pool.submit(block, affinity_key=0)
+    assert active_started.wait(timeout=1)
+    queued = pool.submit(lambda: "must-not-run", affinity_key=0)
+
+    pool.shutdown(wait=False, cancel_futures=True)
+
+    assert queued.cancelled()
+    release_active.set()
+    pool.shutdown(wait=True, cancel_futures=True)
+    assert active.result(timeout=1) == "active-finished"
+
+    with pytest.raises(RuntimeError, match="after shutdown"):
+        pool.submit(lambda: None, affinity_key=0)
+
+
+def test_shutdown_can_escalate_from_graceful_to_cancel_pending() -> None:
+    pool = AffinityThreadPool(max_workers=1)
+    active_started = threading.Event()
+    release_active = threading.Event()
+
+    def block() -> None:
+        active_started.set()
+        assert release_active.wait(timeout=5)
+
+    active = pool.submit(block, affinity_key=0)
+    assert active_started.wait(timeout=1)
+    queued = pool.submit(lambda: None, affinity_key=0)
+
+    pool.shutdown(wait=False)
+    pool.shutdown(wait=False, cancel_futures=True)
+    assert queued.cancelled()
+
+    release_active.set()
+    pool.shutdown(wait=True)
+    assert active.result(timeout=1) is None

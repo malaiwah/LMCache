@@ -12,6 +12,39 @@ T = TypeVar("T")
 logger = init_logger(__name__)
 
 
+def _traceback_free_exception_template(exception: BaseException) -> BaseException:
+    """Copy only durable error fields, never a caught exception traceback.
+
+    ``MessagingFuture`` is long-lived and may be retained by callers. Storing
+    an exception caught in a transport frame would retain that frame, its
+    client, and potentially an entire request payload graph. The stored object
+    is therefore a traceback-free template which is itself never raised.
+    """
+    if isinstance(exception, LMCacheTimeoutError):
+        template: BaseException = LMCacheTimeoutError.from_recorded_timeout(
+            str(exception)
+        )
+    else:
+        clone = getattr(exception, "_lmcache_traceback_free_clone", None)
+        if clone is not None:
+            try:
+                template = clone()
+            except Exception:
+                template = RuntimeError(f"{type(exception).__name__}: {exception}")
+        else:
+            try:
+                template = type(exception)(str(exception))
+            except Exception:
+                template = RuntimeError(f"{type(exception).__name__}: {exception}")
+
+    if template is exception or not isinstance(template, BaseException):
+        template = RuntimeError(f"{type(exception).__name__}: {exception}")
+    template.__traceback__ = None
+    template.__cause__ = None
+    template.__context__ = None
+    return template
+
+
 class MessagingFuture(Generic[T]):
     def __init__(self, on_timeout: Callable[[], None] | None = None):
         self.is_done_ = threading.Event()
@@ -143,10 +176,10 @@ class MessagingFuture(Generic[T]):
         self.complete_transport()
 
     def set_exception(self, exception: BaseException) -> None:
-        """Complete the future with an exception from the messaging system."""
+        """Complete with a traceback-free error template."""
         if not isinstance(exception, BaseException):
             raise TypeError("exception must derive from BaseException")
-        self._complete(exception=exception)
+        self._complete(exception=_traceback_free_exception_template(exception))
         self.complete_transport()
 
     def to_cuda_future(
@@ -194,13 +227,11 @@ class MessagingFuture(Generic[T]):
         return True
 
     def _raise_if_failed(self) -> None:
-        """Raise the terminal failure without attaching state-owned timeouts."""
+        """Raise a fresh failure without mutating the stored template."""
         exception = self.exception_
         if exception is None:
             return
-        if isinstance(exception, LMCacheTimeoutError):
-            raise LMCacheTimeoutError.from_recorded_timeout(str(exception))
-        raise exception
+        raise _traceback_free_exception_template(exception) from None
 
 
 class CUDAMessagingFuture(MessagingFuture[T]):

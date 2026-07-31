@@ -182,7 +182,7 @@ def test_messaging_future_complex_type():
 
 
 def test_messaging_future_exception_is_re_raised():
-    """A remote messaging failure completes the future instead of hanging it."""
+    """Each consumption raises a fresh copy of the stored error template."""
     future = MessagingFuture[int]()
     error = RuntimeError("remote operation failed")
 
@@ -192,7 +192,51 @@ def test_messaging_future_exception_is_re_raised():
     assert future.wait(timeout=0.1)
     with pytest.raises(RuntimeError, match="remote operation failed") as exc_info:
         future.result(timeout=0.1)
-    assert exc_info.value is error
+    assert exc_info.value is not error
+    assert future.exception_ is not error
+    assert future.exception_ is not None
+    assert future.exception_.__traceback__ is None
+
+
+def test_messaging_future_error_template_releases_setter_and_consumer_frames():
+    """Neither caught nor freshly raised errors are retained by the future."""
+
+    class _FrameResource:
+        pass
+
+    future = MessagingFuture[int]()
+
+    def set_caught_failure() -> weakref.ReferenceType[_FrameResource]:
+        setter_local = _FrameResource()
+        setter_ref = weakref.ref(setter_local)
+        try:
+            raise RuntimeError("transport failed")
+        except RuntimeError as exc:
+            future.set_exception(exc)
+        return setter_ref
+
+    setter_ref = set_caught_failure()
+    gc.collect()
+    assert setter_ref() is None
+    assert future.exception_ is not None
+    assert future.exception_.__traceback__ is None
+
+    def consume_failure() -> weakref.ReferenceType[_FrameResource]:
+        consumer_local = _FrameResource()
+        consumer_ref = weakref.ref(consumer_local)
+        try:
+            future.result()
+        except RuntimeError as exc:
+            assert str(exc) == "transport failed"
+            assert exc is not future.exception_
+        return consumer_ref
+
+    first_consumer_ref = consume_failure()
+    second_consumer_ref = consume_failure()
+    gc.collect()
+    assert first_consumer_ref() is None
+    assert second_consumer_ref() is None
+    assert future.exception_.__traceback__ is None
 
 
 def test_messaging_future_rejects_non_exception():

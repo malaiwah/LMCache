@@ -419,6 +419,102 @@ def test_register_unregister_kv_cache(
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
+    reason="CUDA IPC register/store/retrieve recovery requires CUDA",
+)
+def test_same_instance_reregister_after_reset_store_retrieve_unregister(
+    client: MessageQueueClient, client_context: ClientContext
+) -> None:
+    """A reset client can reclaim one ID and immediately use CUDA IPC.
+
+    This is the production recovery sequence: REGISTER, replace the transport,
+    same-ID REGISTER, STORE/RETRIEVE correctness, then
+    confirmed UNREGISTER. It uses real CUDA exporters and the spawned cache
+    server rather than mocked wrapper state.
+    """
+    instance_id = os.getpid()
+    register_payload_suffix = [
+        "testmodel",
+        1,
+        EngineType.VLLM,
+        {},
+        [],
+    ]
+    registered = False
+    try:
+        result = client.submit_request(
+            RequestType.REGISTER_KV_CACHE,
+            [
+                instance_id,
+                client_context.get_kv_cache(),
+                *register_payload_suffix,
+            ],
+            get_response_class(RequestType.REGISTER_KV_CACHE),
+        ).result(timeout=DEFAULT_TIMEOUT)
+        assert result is None
+        registered = True
+
+        assert client.reset_connection()
+        result = client.submit_request(
+            RequestType.REGISTER_KV_CACHE,
+            [
+                instance_id,
+                client_context.get_kv_cache(),
+                *register_payload_suffix,
+            ],
+            get_response_class(RequestType.REGISTER_KV_CACHE),
+        ).result(timeout=DEFAULT_TIMEOUT)
+        assert result is None
+
+        key = create_cache_key(98001)
+        source_block_ids = list(range(BLOCKS_PER_KEY))
+        destination_offset = BLOCKS_PER_KEY
+        destination_block_ids = list(
+            range(destination_offset, destination_offset + BLOCKS_PER_KEY)
+        )
+
+        store_event = torch.cuda.Event(interprocess=True)
+        store_event.record()
+        store_keys(client, [key], instance_id, source_block_ids, store_event)
+        assert lookup_all(client, [key]) == 1
+
+        for layer_cache in client_context.gpu_kv_caches:
+            layer_cache[
+                :, destination_offset : destination_offset + BLOCKS_PER_KEY
+            ].zero_()
+        torch.cuda.synchronize()
+
+        retrieve_event = torch.cuda.Event(interprocess=True)
+        retrieve_event.record()
+        assert retrieve_keys(
+            client,
+            [key],
+            instance_id,
+            destination_block_ids,
+            retrieve_event,
+        ) == [True]
+
+        for layer, layer_cache in enumerate(client_context.gpu_kv_caches):
+            source = layer_cache[:, :BLOCKS_PER_KEY]
+            destination = layer_cache[
+                :, destination_offset : destination_offset + BLOCKS_PER_KEY
+            ]
+            assert torch.allclose(source, destination, atol=1e-4), (
+                f"same-ID recovery corrupted layer {layer}"
+            )
+    finally:
+        if registered:
+            client.submit_request(
+                RequestType.CLEAR, [], get_response_class(RequestType.CLEAR)
+            ).result(timeout=DEFAULT_TIMEOUT)
+            client.submit_request(
+                RequestType.UNREGISTER_KV_CACHE,
+                [instance_id],
+                get_response_class(RequestType.UNREGISTER_KV_CACHE),
+            ).result(timeout=DEFAULT_TIMEOUT)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
     reason="Store and Lookup require CUDA",
 )
 def test_store_and_lookup(

@@ -47,6 +47,8 @@ class AffinityThreadPool:
         self._key_to_slot: dict[int, int] = {}
         self._next_slot = 0
         self._overflow_warned = False
+        self._shutdown = False
+        self._shutdown_lock = threading.Lock()
         for i in range(max_workers):
             t = threading.Thread(
                 target=self._worker,
@@ -136,19 +138,49 @@ class AffinityThreadPool:
 
         Returns a :class:`concurrent.futures.Future`.
         """
-        future: Future = Future()
-        slot = self._slot_for_key(affinity_key)
-        self._queues[slot].put((future, fn, args, kwargs))
+        with self._shutdown_lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            future: Future = Future()
+            slot = self._slot_for_key(affinity_key)
+            self._queues[slot].put((future, fn, args, kwargs))
         return future
 
-    def shutdown(self, wait: bool = True) -> None:
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
         """Shut down the pool.
 
-        Sends a shutdown sentinel to every worker.  If *wait* is true, blocks
-        until all workers have exited.
+        Optionally cancels work which has not started, then sends a shutdown
+        sentinel to every worker. Repeated calls are safe; a later
+        ``wait=True`` call joins workers after an earlier non-waiting shutdown.
         """
-        for q in self._queues:
-            q.put(_SHUTDOWN)
+        to_cancel: list[Future] = []
+        with self._shutdown_lock:
+            if not self._shutdown:
+                self._shutdown = True
+                for q in self._queues:
+                    q.put(_SHUTDOWN)
+            if cancel_futures:
+                # A caller may first request a non-waiting graceful shutdown,
+                # then escalate to cancellation. Drain tasks which have not
+                # started while preserving each worker's shutdown sentinel.
+                for q in self._queues:
+                    saw_shutdown = False
+                    while True:
+                        try:
+                            item = q.get_nowait()
+                        except queue.Empty:
+                            break
+                        if item is _SHUTDOWN:
+                            saw_shutdown = True
+                        else:
+                            future, _fn, _args, _kwargs = item
+                            to_cancel.append(future)
+                    if saw_shutdown:
+                        q.put(_SHUTDOWN)
+        # Future callbacks are user code and may attempt another submit. Run
+        # them only after releasing the pool lifecycle lock.
+        for future in to_cancel:
+            future.cancel()
         if wait:
             for t in self._threads:
                 t.join()

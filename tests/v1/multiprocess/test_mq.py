@@ -269,6 +269,7 @@ def test_server_no_handler_path_releases_transferred_wire_export(
     server._output_efd.fileno.return_value = 99
     server.poller = MagicMock()
     server.is_finished = threading.Event()
+    server._intake_lock = threading.Lock()
     server.handlers = {}
     server._queue_error_response = MagicMock()
     server.socket.recv_multipart.return_value = [
@@ -310,6 +311,7 @@ def test_server_unknown_request_type_releases_wire_export_and_stays_alive(
     server._output_efd.fileno.return_value = 99
     server.poller = MagicMock()
     server.is_finished = threading.Event()
+    server._intake_lock = threading.Lock()
     server.handlers = {}
     server._queue_error_response = MagicMock()
     server.socket.recv_multipart.return_value = [
@@ -1271,9 +1273,7 @@ def test_sent_timeout_stays_pending_until_late_response_is_transport_safe() -> N
         future.result()
 
 
-def test_malformed_success_response_completes_transport_without_client_leak(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_malformed_success_response_completes_transport_without_client_leak() -> None:
     """A bad reply cannot leave an unresolved, untracked future/resource."""
 
     class _TransportResource:
@@ -1286,9 +1286,6 @@ def test_malformed_success_response_completes_transport_without_client_leak(
     client._polling_loop = MagicMock()
     client.socket = MagicMock()
     client_ref = weakref.ref(client)
-    # Captured logger traceback records independently retain the frame. The
-    # ownership contract under test is the exception stored by the future.
-    monkeypatch.setattr(mq_mod.logger, "exception", lambda *_args, **_kwargs: None)
 
     future: mq_mod.MessagingFuture[Any] = client.submit_request(RequestType.NOOP, [])
     resource = _TransportResource()
@@ -1323,6 +1320,287 @@ def test_malformed_success_response_completes_transport_without_client_leak(
     with pytest.raises(
         RuntimeError, match="Failed to decode.*ValidationError.*Expected `str`"
     ):
+        future.result()
+
+
+def test_outbound_caught_failure_does_not_retain_payload_or_client() -> None:
+    """A retained failed future owns no caught outbound traceback graph."""
+
+    class _Payload:
+        pass
+
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.input_queue = queue.Queue()
+    client._request_counter = itertools.count(19)
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    client.socket = MagicMock()
+    client_ref = weakref.ref(client)
+
+    payload = _Payload()
+    payload_ref = weakref.ref(payload)
+    # NOOP accepts no payloads. The count error is caught inside
+    # process_outbound_task while its frame still owns client and payload.
+    future = client.submit_request(RequestType.NOOP, [payload])
+    del payload
+    client.process_outbound_task()
+
+    assert future.exception_ is not None
+    assert future.exception_.__traceback__ is None
+    client.socket.send_multipart.assert_not_called()
+    del client
+    gc.collect()
+
+    assert payload_ref() is None
+    assert client_ref() is None
+    with pytest.raises(ValueError, match="Payload count mismatch"):
+        future.result()
+
+
+def test_remote_handler_error_template_preserves_fields_without_tracebacks() -> None:
+    future: mq_mod.MessagingFuture[Any] = mq_mod.MessagingFuture()
+    caught = RemoteHandlerError(RequestType.NOOP, "ValueError", "remote detail")
+    future.set_exception(caught)
+
+    assert future.exception_ is not caught
+    assert future.exception_ is not None
+    assert future.exception_.__traceback__ is None
+    raised: list[RemoteHandlerError] = []
+    for _ in range(2):
+        with pytest.raises(RemoteHandlerError) as exc_info:
+            future.result()
+        raised.append(exc_info.value)
+        assert exc_info.value.request_type is RequestType.NOOP
+        assert exc_info.value.error_type == "ValueError"
+        assert exc_info.value.remote_message == "remote detail"
+
+    assert raised[0] is not raised[1]
+    assert all(error is not future.exception_ for error in raised)
+
+
+def test_request_without_ipc_exports_has_no_ownership_or_ipc_quarantine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ordinary requests retain events separately and never fake IPC owners."""
+    ipc_quarantine = MagicMock()
+    monkeypatch.setattr(
+        mq_mod, "_quarantine_sent_unanswered_ipc_exports", ipc_quarantine
+    )
+    monkeypatch.setattr(mq_mod, "_SENT_UNANSWERED_IPC_QUARANTINE", [])
+    monkeypatch.setattr(mq_mod, "_SENT_UNANSWERED_TRANSPORT_QUARANTINE", [])
+    monkeypatch.setattr(
+        mq_mod,
+        "acquire_ipc_export_lease",
+        MagicMock(side_effect=AssertionError("empty exports must not acquire a lease")),
+    )
+
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.input_queue = queue.Queue()
+    client._request_counter = itertools.count(20)
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    client.socket = MagicMock()
+
+    future = client.submit_request(RequestType.NOOP, [])
+    wrapped = client.input_queue.get_nowait()
+    assert wrapped.ipc_ownership is None
+    client.input_queue.put(wrapped)
+
+    transport_resource = object()
+    future.retain_until_transport_complete(transport_resource)
+    client.process_outbound_task()
+
+    assert client._inflight_ownership == {}
+    ipc_quarantine.assert_not_called()
+    client._fail_outstanding("session lost")
+
+    assert mq_mod._SENT_UNANSWERED_IPC_QUARANTINE == []
+    assert mq_mod._SENT_UNANSWERED_TRANSPORT_QUARANTINE == [[transport_resource]]
+    with pytest.raises(ConnectionError, match="session lost"):
+        future.result()
+
+
+def test_valid_uid_invalid_response_type_terminalizes_matching_future() -> None:
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.input_queue = queue.Queue()
+    client._request_counter = itertools.count(30)
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    client.socket = MagicMock()
+
+    future = client.submit_request(RequestType.NOOP, [])
+    client.process_outbound_task()
+    client.socket.recv_multipart.return_value = [
+        mq_mod.encode_request_uid(30),
+        msgspec.msgpack.encode(2**31 - 1),
+    ]
+
+    client.process_inbound()
+
+    assert client.pending_futures == {}
+    assert client._pending_request_types == {}
+    assert future.transport_complete
+    with pytest.raises(RuntimeError, match="Invalid enum value"):
+        future.result()
+
+
+def test_invalid_response_type_for_unknown_uid_retires_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mq_mod, "_SENT_UNANSWERED_IPC_QUARANTINE", [])
+    monkeypatch.setattr(mq_mod, "_SENT_UNANSWERED_TRANSPORT_QUARANTINE", [])
+    loop = ClientPollingLoop.__new__(ClientPollingLoop)
+    loop._poller = MagicMock()
+    old_socket = MagicMock(name="old_socket")
+    new_socket = MagicMock(name="new_socket")
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.ctx = MagicMock()
+    client.ctx.socket.return_value = new_socket
+    client.server_url = "tcp://127.0.0.1:16027"
+    client.socket = old_socket
+    client._socket_closed = False
+    client._socket_close_lock = threading.Lock()
+    client.input_queue = queue.Queue()
+    client._request_counter = itertools.count(35)
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    loop._socket_to_client = {old_socket: client}
+
+    future = client.submit_request(RequestType.NOOP, [])
+    client.process_outbound_task()
+    old_socket.recv_multipart.return_value = [
+        mq_mod.encode_request_uid(999),
+        msgspec.msgpack.encode(2**31 - 1),
+    ]
+
+    loop._process_inbound_client(client)
+
+    assert client.socket is new_socket
+    assert client.pending_futures == {}
+    with pytest.raises(ConnectionError, match="became unhealthy"):
+        future.result()
+
+
+def test_valid_uid_mismatched_response_type_terminalizes_matching_future() -> None:
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.input_queue = queue.Queue()
+    client._request_counter = itertools.count(31)
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    client.socket = MagicMock()
+
+    future = client.submit_request(RequestType.NOOP, [])
+    client.process_outbound_task()
+    client.socket.recv_multipart.return_value = [
+        mq_mod.encode_request_uid(31),
+        mq_mod.msgspec_encode(RequestType.LOOKUP, cls=RequestType),
+    ]
+
+    client.process_inbound()
+
+    assert client.pending_futures == {}
+    assert client._pending_request_types == {}
+    with pytest.raises(RuntimeError, match="expected NOOP, got LOOKUP"):
+        future.result()
+
+
+def test_truncated_correlatable_header_fails_one_then_retires_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Known UID is terminal; all ambiguous peers are quarantined on reset."""
+
+    class _Resource:
+        pass
+
+    monkeypatch.setattr(mq_mod, "_SENT_UNANSWERED_IPC_QUARANTINE", [])
+    monkeypatch.setattr(mq_mod, "_SENT_UNANSWERED_TRANSPORT_QUARANTINE", [])
+    loop = ClientPollingLoop.__new__(ClientPollingLoop)
+    loop._poller = MagicMock()
+    old_socket = MagicMock(name="old_socket")
+    new_socket = MagicMock(name="new_socket")
+
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.ctx = MagicMock()
+    client.ctx.socket.return_value = new_socket
+    client.server_url = "tcp://127.0.0.1:16025"
+    client.socket = old_socket
+    client._socket_closed = False
+    client._socket_close_lock = threading.Lock()
+    client.input_queue = queue.Queue()
+    client._request_counter = itertools.count(32)
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    loop._socket_to_client = {old_socket: client}
+
+    first = client.submit_request(RequestType.NOOP, [])
+    second = client.submit_request(RequestType.NOOP, [])
+    first_resource = _Resource()
+    first_resource_ref = weakref.ref(first_resource)
+    second_resource = _Resource()
+    first.retain_until_transport_complete(first_resource)
+    second.retain_until_transport_complete(second_resource)
+    del first_resource
+    client.process_outbound_task()
+    old_socket.recv_multipart.return_value = [mq_mod.encode_request_uid(32)]
+
+    loop._process_inbound_client(client)
+    gc.collect()
+
+    assert first_resource_ref() is None
+    with pytest.raises(RuntimeError, match="truncated header"):
+        first.result()
+    with pytest.raises(ConnectionError, match="became unhealthy"):
+        second.result()
+    assert mq_mod._SENT_UNANSWERED_IPC_QUARANTINE == []
+    assert mq_mod._SENT_UNANSWERED_TRANSPORT_QUARANTINE == [[second_resource]]
+    assert client.pending_futures == {}
+    assert client.socket is new_socket
+    old_socket.close.assert_called_once_with(linger=0)
+    loop._poller.unregister.assert_called_once_with(old_socket)
+    loop._poller.register.assert_called_once_with(new_socket, zmq.POLLIN)
+
+
+def test_uncorrelatable_uid_retires_session_and_quarantines_ipc_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An invalid UID cannot release a sent CUDA export speculatively."""
+    monkeypatch.setattr(mq_mod, "_SENT_UNANSWERED_IPC_QUARANTINE", [])
+    monkeypatch.setattr(mq_mod, "_SENT_UNANSWERED_TRANSPORT_QUARANTINE", [])
+    monkeypatch.setattr(
+        mq_mod, "get_payload_classes", lambda _request_type: [DeviceIPCWrapper]
+    )
+    monkeypatch.setattr(mq_mod, "msgspec_encode", lambda *_args, **_kwargs: b"encoded")
+
+    loop = ClientPollingLoop.__new__(ClientPollingLoop)
+    loop._poller = MagicMock()
+    old_socket = MagicMock(name="old_socket")
+    new_socket = MagicMock(name="new_socket")
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.ctx = MagicMock()
+    client.ctx.socket.return_value = new_socket
+    client.server_url = "tcp://127.0.0.1:16026"
+    client.socket = old_socket
+    client._socket_closed = False
+    client._socket_close_lock = threading.Lock()
+    client.input_queue = queue.Queue()
+    client._request_counter = itertools.count(34)
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    loop._socket_to_client = {old_socket: client}
+
+    wrapper = _TrackedIPCWrapper()
+    future = client.submit_request(RequestType.NOOP, [wrapper])
+    client.process_outbound_task()
+    ownership = client._inflight_ownership[34]
+    assert wrapper.state == "transferred"
+    old_socket.recv_multipart.return_value = [b"not-msgpack", b"type"]
+
+    loop._process_inbound_client(client)
+
+    assert mq_mod._SENT_UNANSWERED_IPC_QUARANTINE == [ownership]
+    assert wrapper.release_calls == 0
+    assert client.socket is new_socket
+    with pytest.raises(ConnectionError, match="became unhealthy"):
         future.result()
 
 
@@ -1533,7 +1811,7 @@ def test_healthy_send_response_cycles_do_not_grow_process_quarantine(
         assert mq_mod._SENT_UNANSWERED_IPC_QUARANTINE == []
 
         client.socket.recv_multipart.return_value = [
-            str(request_uid).encode(),
+            mq_mod.encode_request_uid(request_uid),
             b"type",
             b"response",
         ]
@@ -1625,11 +1903,15 @@ def test_accepted_send_quarantine_survives_fast_response_and_gc(
     # A reply may race immediately after send and removes both pending_futures
     # and _inflight_ownership. The process quarantine must remain the strong
     # producer-allocation owner after every ordinary reference is gone.
-    decoded = iter([24, RequestType.NOOP, "NOOP_OK"])
+    decoded = iter([RequestType.NOOP, "NOOP_OK"])
     monkeypatch.setattr(
         mq_mod, "msgspec_decode", lambda *_args, **_kwargs: next(decoded)
     )
-    client.socket.recv_multipart.return_value = [b"uid", b"type", b"response"]
+    client.socket.recv_multipart.return_value = [
+        mq_mod.encode_request_uid(24),
+        b"type",
+        b"response",
+    ]
     client.process_inbound()
     assert client.pending_futures == {}
     assert client._inflight_ownership == {}
@@ -1993,6 +2275,112 @@ def test_blocking_handler_failure_completes_future():
     finally:
         client.close()
         server.close()
+
+
+def test_server_close_cancels_queued_handler_and_drains_active_handler() -> None:
+    """Transport teardown waits until callbacks can no longer notify it."""
+    context = zmq.Context.instance()
+    server_url = "tcp://127.0.0.1:16031"
+    server = MessageQueueServer(server_url, context)
+    active_started = threading.Event()
+    release_active = threading.Event()
+    calls: list[int] = []
+
+    def blocking_lookup(_key: IPCCacheServerKey, _worker_id: int) -> None:
+        calls.append(1)
+        active_started.set()
+        assert release_active.wait(timeout=5)
+
+    server.add_blocking_handler(
+        RequestType.LOOKUP,
+        get_payload_classes(RequestType.LOOKUP),
+        blocking_lookup,
+    )
+    server.add_normal_thread_pool([RequestType.LOOKUP], max_workers=1)
+    server.start()
+    client = MessageQueueClient(server_url, context)
+    close_errors: list[BaseException] = []
+
+    try:
+        client.submit_request(RequestType.LOOKUP, [create_cache_key(7101), 1])
+        client.submit_request(RequestType.LOOKUP, [create_cache_key(7102), 1])
+        assert active_started.wait(timeout=2)
+        deadline = time.monotonic() + 2
+        with server._handler_futures_cv:
+            while len(server._handler_futures) < 2:
+                remaining = deadline - time.monotonic()
+                assert remaining > 0
+                server._handler_futures_cv.wait(timeout=remaining)
+
+        def close_server() -> None:
+            try:
+                server.close(handler_timeout_s=2)
+            except BaseException as exc:
+                close_errors.append(exc)
+
+        closer = threading.Thread(target=close_server)
+        closer.start()
+        deadline = time.monotonic() + 1
+        with server._handler_futures_cv:
+            while len(server._handler_futures) != 1:
+                remaining = deadline - time.monotonic()
+                assert remaining > 0
+                server._handler_futures_cv.wait(timeout=remaining)
+        assert closer.is_alive(), "close returned while the active handler was running"
+        release_active.set()
+        closer.join(timeout=2)
+
+        assert not closer.is_alive()
+        assert close_errors == []
+        assert calls == [1], "the queued handler must be cancelled, not started"
+        assert server._handler_futures == set()
+        assert server._closed
+    finally:
+        release_active.set()
+        if not server._closed:
+            server.close(handler_timeout_s=2)
+        client.close()
+
+
+def test_server_close_timeout_keeps_transport_open_until_retry() -> None:
+    """A bounded close fails safe rather than tearing resources under work."""
+    context = zmq.Context.instance()
+    server_url = "tcp://127.0.0.1:16032"
+    server = MessageQueueServer(server_url, context)
+    active_started = threading.Event()
+    release_active = threading.Event()
+
+    def blocking_lookup(_key: IPCCacheServerKey, _worker_id: int) -> None:
+        active_started.set()
+        assert release_active.wait(timeout=5)
+
+    server.add_blocking_handler(
+        RequestType.LOOKUP,
+        get_payload_classes(RequestType.LOOKUP),
+        blocking_lookup,
+    )
+    server.add_normal_thread_pool([RequestType.LOOKUP], max_workers=1)
+    server.start()
+    client = MessageQueueClient(server_url, context)
+
+    try:
+        client.submit_request(RequestType.LOOKUP, [create_cache_key(7201), 1])
+        assert active_started.wait(timeout=2)
+
+        with pytest.raises(TimeoutError, match="draining LMCache MQ handlers"):
+            server.close(handler_timeout_s=0.05)
+
+        assert not server._closed
+        assert not server.socket.closed
+        release_active.set()
+        server.close(handler_timeout_s=2)
+        assert server._closed
+        assert server.socket.closed
+    finally:
+        release_active.set()
+        if not server._closed:
+            server.close(handler_timeout_s=2)
+        client.close()
 
 
 def test_shared_loop_recreate():
