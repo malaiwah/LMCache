@@ -10,9 +10,11 @@ Backed by the native C++ filesystem connector wrapped with
 from __future__ import annotations
 
 # Standard
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
+    from lmcache.v1.distributed.api import ObjectKey
     from lmcache.v1.distributed.internal_api import (
         L1MemoryDesc,
     )
@@ -158,7 +160,7 @@ def _create_fs_native_l2_adapter(
         config.use_odirect,
         config.read_ahead_size,
     )
-    return NativeConnectorL2Adapter(
+    adapter = NativeConnectorL2Adapter(
         native_client,
         max_capacity_gb=config.max_capacity_gb,
         type_name="FSNativeL2Adapter",
@@ -168,6 +170,53 @@ def _create_fs_native_l2_adapter(
             "num_workers": config.num_workers,
             "read_ahead_size": config.read_ahead_size,
         },
+    )
+    try:
+        keys, sizes = _scan_existing_fs_native_files(config.base_path)
+        adapter.prime_existing_keys(keys, sizes)
+    except Exception:
+        adapter.close()
+        raise
+    return adapter
+
+
+def _scan_existing_fs_native_files(
+    base_path: str,
+) -> tuple[list["ObjectKey"], list[int]]:
+    """Recover durable keys and sizes, ordered from oldest to newest."""
+    # First Party
+    from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
+        _filename_to_object_key,
+    )
+
+    root = Path(base_path)
+    if not root.is_dir():
+        return [], []
+
+    entries: list[tuple[int, str, ObjectKey, int]] = []
+    for path in root.glob("*.data"):
+        try:
+            if not path.is_file():
+                continue
+            key = _filename_to_object_key(path.name)
+            if key is None:
+                logger.warning("Ignoring unrecognized cache file: %s", path)
+                continue
+            stat = path.stat()
+            if stat.st_size <= 0:
+                logger.warning("Ignoring empty cache file: %s", path)
+                continue
+            entries.append((stat.st_mtime_ns, path.name, key, stat.st_size))
+        except OSError as exc:
+            # Silently omitting a durable object would under-report usage and
+            # seed an incomplete eviction index. Fail adapter construction so
+            # the operator can repair the directory or retry the startup scan.
+            raise RuntimeError(f"Could not inspect cache file {path}: {exc}") from exc
+
+    entries.sort(key=lambda entry: (entry[0], entry[1]))
+    return (
+        [entry[2] for entry in entries],
+        [entry[3] for entry in entries],
     )
 
 

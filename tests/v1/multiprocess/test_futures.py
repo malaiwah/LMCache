@@ -173,6 +173,27 @@ def test_messaging_future_complex_type():
     thread.join()
 
 
+def test_messaging_future_exception_is_re_raised():
+    """A remote messaging failure completes the future instead of hanging it."""
+    future = MessagingFuture[int]()
+    error = RuntimeError("remote operation failed")
+
+    future.set_exception(error)
+
+    assert future.query()
+    assert future.wait(timeout=0.1)
+    with pytest.raises(RuntimeError, match="remote operation failed") as exc_info:
+        future.result(timeout=0.1)
+    assert exc_info.value is error
+
+
+def test_messaging_future_rejects_non_exception():
+    future = MessagingFuture[int]()
+
+    with pytest.raises(TypeError, match="must derive from BaseException"):
+        future.set_exception("not an exception")  # type: ignore[arg-type]
+
+
 # ==============================================================================
 # CUDAMessagingFuture Tests
 # ==============================================================================

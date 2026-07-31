@@ -29,6 +29,11 @@ def noop_handler() -> str:
     return "NOOP_OK"
 
 
+def failing_noop_handler() -> str:
+    """Raise a deterministic error for RPC error propagation tests."""
+    raise ValueError("intentional sync handler failure")
+
+
 # ==============================================================================
 # REGISTER_KV_CACHE Request Handlers
 # ==============================================================================
@@ -201,6 +206,12 @@ def lookup_handler(key: KeyType, tp_size: int) -> None:
     # For testing, we just validate the input
     assert isinstance(key, KeyType), f"Expected key to be KeyType, got {type(key)}"
     assert isinstance(tp_size, int), f"Expected tp_size to be int, got {type(tp_size)}"
+
+
+def failing_lookup_handler(key: KeyType, tp_size: int) -> None:
+    """Raise a deterministic error from a blocking request handler."""
+    del key, tp_size
+    raise OSError("intentional blocking handler failure")
 
 
 # ==============================================================================

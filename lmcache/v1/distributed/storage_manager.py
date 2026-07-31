@@ -66,6 +66,7 @@ logger = init_logger(__name__)
 
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
+        self._eviction_config = config.eviction_config
         self._l1_manager = L1Manager(config.l1_manager_config)
         self._event_bus = get_event_bus()
 
@@ -153,6 +154,31 @@ class StorageManager:
             max_in_flight=config.prefetch_max_in_flight,
         )
         self._prefetch_controller.start()
+
+        # Opt-in L1 write-back tier: wire L2 adapters into the L1 eviction
+        # controller so evicted or periodically backed-up chunks are flushed
+        # to L2, and optionally let the prefetch controller trigger
+        # emergency eviction to make room for large restores.
+        eviction_config = config.eviction_config
+        wants_l1_write_back = (
+            eviction_config.write_back_on_evict
+            or eviction_config.periodic_flush_interval > 0
+        )
+        if wants_l1_write_back:
+            self._sync_l1_writeback_adapters()
+            if not self._eviction_controller.has_l2_flush_adapter():
+                logger.warning(
+                    "write_back_on_evict / periodic_flush_interval is set but "
+                    "no L2 adapter exposes store_objects_sync"
+                )
+        if (
+            eviction_config.emergency_evict_for_prefetch
+            and not self._eviction_controller.has_l2_flush_adapter()
+        ):
+            logger.warning(
+                "emergency_evict_for_prefetch has no synchronous L2 "
+                "adapter; inactive until one is added"
+            )
 
         # L2 usage gauge — one observation per adapter, tagged by
         # ``l2_name``.  Parallel to L1Manager's ``l1_memory_usage_bytes``.
@@ -904,6 +930,7 @@ class StorageManager:
             with self._adapters_lock:
                 self._l2_adapters[adapter_id] = adapter
                 self._adapter_descriptors[adapter_id] = descriptor
+            self._sync_l1_writeback_adapters()
             self._store_controller.add_adapter(adapter_id, adapter, descriptor)
             self._prefetch_controller.add_adapter(adapter_id, adapter, descriptor)
             if self._should_enable_l2_eviction(adapter, config.eviction_config):
@@ -956,6 +983,9 @@ class StorageManager:
             with self._adapters_lock:
                 adapter = self._l2_adapters.pop(adapter_id)
                 self._adapter_descriptors.pop(adapter_id, None)
+            # Waits for any synchronous L1 flush using the removed adapter
+            # before adapter.close() releases its native resources.
+            self._sync_l1_writeback_adapters()
             adapter.close()
             logger.info("Deleted L2 adapter %d", adapter_id)
 
@@ -1120,6 +1150,21 @@ class StorageManager:
             )
             return False
         return True
+
+    def _sync_l1_writeback_adapters(self) -> None:
+        """Publish the current adapter set to the optional L1 writeback tier."""
+        config = self._eviction_config
+        if not (config.write_back_on_evict or config.periodic_flush_interval > 0):
+            return
+        with self._adapters_lock:
+            adapters = dict(self._l2_adapters)
+        self._eviction_controller.set_l2_adapters(adapters)
+        if config.emergency_evict_for_prefetch:
+            self._prefetch_controller.set_l1_eviction_controller(
+                self._eviction_controller
+                if self._eviction_controller.has_l2_flush_adapter()
+                else None
+            )
 
     def _unwrap_reconfigurable_l2_adapter(
         self,

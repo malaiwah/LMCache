@@ -354,13 +354,8 @@ class L2AdapterInterface(ABC):
         """Register a listener to receive L2 adapter events."""
         self._listeners.append(listener)
 
-    def _notify_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
-        """Update byte accounting and notify listeners that ``keys`` were
-        stored. ``sizes[i]`` is the byte size of ``keys[i]``.
-
-        Accounting is held under ``_usage_lock``; listener callbacks fire
-        outside the lock so a slow listener cannot stall further notifies.
-        """
+    def _account_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
+        """Apply stored-key byte accounting without invoking listeners."""
         # Aggregate per-salt deltas before touching
         # ``_bytes_by_cache_salt`` — one dict read/write per unique
         # salt instead of one per key. This matters when the registry is
@@ -377,8 +372,25 @@ class L2AdapterInterface(ABC):
                 self._bytes_by_cache_salt[salt] = (
                     self._bytes_by_cache_salt.get(salt, 0) + d
                 )
+
+    def _notify_keys_stored_listeners(
+        self,
+        keys: list[ObjectKey],
+        sizes: list[int],
+    ) -> None:
+        """Notify stored-key observers after accounting is committed."""
         for listener in self._listeners:
             listener.on_l2_keys_stored(keys, sizes)
+
+    def _notify_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
+        """Update byte accounting and notify listeners that ``keys`` were
+        stored. ``sizes[i]`` is the byte size of ``keys[i]``.
+
+        Accounting is held under ``_usage_lock``; listener callbacks fire
+        outside the lock so a slow listener cannot stall further notifies.
+        """
+        self._account_keys_stored(keys, sizes)
+        self._notify_keys_stored_listeners(keys, sizes)
 
     def _notify_keys_accessed(self, keys: list[ObjectKey]) -> None:
         # ``_notify_keys_accessed`` carries no byte impact — only LRU

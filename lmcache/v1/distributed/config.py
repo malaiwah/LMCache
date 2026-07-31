@@ -226,6 +226,21 @@ class EvictionConfig:
     extra_logging_interval: float = field(default=10.0)
     """ Seconds between L1 memory usage log lines when extra logging is enabled. """
 
+    write_back_on_evict: bool = field(default=False)
+    """ Flush evicted L1 objects to L2 synchronously and delete them from L1
+    only once every key in the batch is durable; without this, eviction
+    discards the objects. Requires an L2 adapter with store_objects_sync(). """
+
+    periodic_flush_interval: float = field(default=0.0)
+    """ Seconds between periodic L1-to-L2 backup flush scans while below the
+    eviction watermark (0 disables). Backup keeps the L1 copy; only L2 gains
+    a copy, so a restart or session expiry no longer costs a cold prefill. """
+
+    emergency_evict_for_prefetch: bool = field(default=False)
+    """ Allow the prefetch controller to synchronously evict LRU L1 keys to
+    make room for large L2-to-L1 restores. Effective only together with
+    write_back_on_evict, so victims are persisted before deletion. """
+
 
 @dataclass
 class StorageManagerConfig:
@@ -296,6 +311,12 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
         ValueError: If mutually exclusive L1 tiers are both configured, or
             hybrid L1 is paired with incompatible L2 adapters.
     """
+    eviction = config.eviction_config
+    if eviction.periodic_flush_interval < 0:
+        raise ValueError("periodic_flush_interval must be >= 0")
+    if eviction.emergency_evict_for_prefetch and not eviction.write_back_on_evict:
+        raise ValueError("emergency_evict_for_prefetch requires write_back_on_evict")
+
     if (
         config.l1_manager_config.gds_l1_config is not None
         and config.l1_manager_config.memory_config.devdax_path
@@ -471,6 +492,28 @@ def add_storage_manager_args(
         help="The fraction of memory to evict when triggered (0.0 to 1.0). "
         "Default is 0.2.",
     )
+    eviction_group.add_argument(
+        "--write-back-on-evict",
+        action="store_true",
+        help="Flush evicted L1 objects to L2 synchronously and delete them "
+        "from L1 only once every key in the batch is durable. Requires an "
+        "L2 adapter with a synchronous store path.",
+    )
+    eviction_group.add_argument(
+        "--periodic-flush-interval",
+        type=float,
+        default=0.0,
+        help="Seconds between periodic L1-to-L2 backup flush scans while "
+        "below the eviction watermark (0 disables). The backup keeps the "
+        "L1 copy; only L2 gains a copy.",
+    )
+    eviction_group.add_argument(
+        "--emergency-evict-for-prefetch",
+        action="store_true",
+        help="Allow the prefetch controller to synchronously evict LRU L1 "
+        "keys to make room for large L2-to-L1 restores. Effective only "
+        "together with --write-back-on-evict.",
+    )
 
     # L2 Policies
     # Import here to break circular dependency:
@@ -596,6 +639,11 @@ def parse_args_to_config(
         eviction_ratio=args.eviction_ratio,
         extra_logging_enabled=getattr(args, "enable_extra_logging", False),
         extra_logging_interval=getattr(args, "extra_logging_interval", 10.0),
+        write_back_on_evict=getattr(args, "write_back_on_evict", False),
+        periodic_flush_interval=getattr(args, "periodic_flush_interval", 0.0),
+        emergency_evict_for_prefetch=getattr(
+            args, "emergency_evict_for_prefetch", False
+        ),
     )
 
     l2_adapter_config = parse_args_to_l2_adapters_config(args)

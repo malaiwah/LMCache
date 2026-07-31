@@ -14,6 +14,7 @@ class MessagingFuture(Generic[T]):
     def __init__(self):
         self.is_done_ = threading.Event()
         self.result_ = None
+        self.exception_: BaseException | None = None
 
     def query(self) -> bool:
         """
@@ -54,6 +55,8 @@ class MessagingFuture(Generic[T]):
         flag = self.wait(timeout)
         if not flag:
             raise LMCacheTimeoutError("Future result not available within timeout")
+        if self.exception_ is not None:
+            raise self.exception_
         return self.result_
 
     def set_result(self, result: T) -> None:
@@ -66,6 +69,13 @@ class MessagingFuture(Generic[T]):
             result (T): The result to set.
         """
         self.result_ = result
+        self.is_done_.set()
+
+    def set_exception(self, exception: BaseException) -> None:
+        """Complete the future with an exception from the messaging system."""
+        if not isinstance(exception, BaseException):
+            raise TypeError("exception must derive from BaseException")
+        self.exception_ = exception
         self.is_done_.set()
 
     def to_cuda_future(

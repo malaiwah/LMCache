@@ -5,6 +5,7 @@ Managing objects and memory for L1 cache
 
 # Standard
 from dataclasses import dataclass
+from itertools import chain, islice
 from typing import Literal
 import threading
 
@@ -462,6 +463,11 @@ class L1Manager:
         Errors:
             KEY_NOT_WRITABLE: The key exists but is not writable.
             OUT_OF_MEMORY: Not enough memory to allocate for the object.
+
+        Note:
+            When the full batch does not fit, the longest prefix of the
+            to-be-allocated keys that fits is allocated and the remaining
+            keys report OUT_OF_MEMORY.
         """
         need_to_allocate: list[tuple[ObjectKey, bool]] = []
         ret: dict[ObjectKey, L1OperationResult] = {}
@@ -499,6 +505,26 @@ class L1Manager:
             layout_desc, len(need_to_allocate)
         )
 
+        # A full-batch allocation failure would fail every key even when
+        # most of the batch fits, collapsing large L2->L1 restores to zero
+        # prefix hits and forcing full re-prefills upstream. Fall back to
+        # allocating the longest prefix that fits; callers already handle
+        # per-key OOM (prefetch trims to the contiguous prefix, the store
+        # path skips failed keys).
+        if err != L1Error.SUCCESS and len(need_to_allocate) > 1:
+            if allocated_objs:
+                self._memory_manager.free(allocated_objs)
+                allocated_objs = []
+            err, allocated_objs = self._allocate_largest_prefix(
+                layout_desc, len(need_to_allocate)
+            )
+            if err == L1Error.SUCCESS:
+                logger.warning(
+                    "Partial L1 allocation: %d/%d objects (prefix) allocated",
+                    len(allocated_objs),
+                    len(need_to_allocate),
+                )
+
         if err != L1Error.SUCCESS:
             for key, _ in need_to_allocate:
                 ret[key] = (L1Error.OUT_OF_MEMORY, None)
@@ -508,6 +534,10 @@ class L1Manager:
                 self._memory_manager.free(allocated_objs)
 
         else:
+            # Mark any unallocated tail as OOM so every requested key keeps
+            # an explicit per-key result.
+            for key, _ in need_to_allocate[len(allocated_objs) :]:
+                ret[key] = (L1Error.OUT_OF_MEMORY, None)
             for (key, is_temp), mem_obj in zip(
                 need_to_allocate, allocated_objs, strict=False
             ):
@@ -530,6 +560,41 @@ class L1Manager:
             )
         )
         return ret
+
+    def _allocate_largest_prefix(
+        self, layout_desc: MemoryLayoutDesc, want: int
+    ) -> tuple[L1Error, list[MemoryObj]]:
+        """Allocate the largest prefix below an already-failed full batch.
+
+        L1 allocators have an all-or-nothing batch contract. While holding the
+        L1 manager lock, allocation feasibility is therefore monotonic: if a
+        batch of size ``n`` fits, every smaller batch also fits. Binary search
+        finds the maximum without relying on byte estimates that can be wrong
+        for alignment or fragmented free lists. Successful probes are freed
+        before the final allocation.
+
+        This recovery path runs only after the ``want`` allocation failed, so
+        normal reservations still perform exactly one allocation.
+        """
+        low = 1
+        high = want - 1
+        largest = 0
+
+        while low <= high:
+            candidate = (low + high) // 2
+            err, objects = self._memory_manager.allocate(layout_desc, candidate)
+            if err == L1Error.SUCCESS:
+                largest = candidate
+                self._memory_manager.free(objects)
+                low = candidate + 1
+            else:
+                if objects:
+                    self._memory_manager.free(objects)
+                high = candidate - 1
+
+        if largest == 0:
+            return L1Error.OUT_OF_MEMORY, []
+        return self._memory_manager.allocate(layout_desc, largest)
 
     @l1_mgr_synchronized
     def finish_write(
@@ -792,6 +857,59 @@ class L1Manager:
             len(keys_to_clear),
             locked_count,
         )
+
+    @l1_mgr_synchronized
+    def get_evictable_keys(
+        self,
+        limit: int,
+        cursor: int = 0,
+        scan_limit: int | None = None,
+    ) -> tuple[list[ObjectKey], int]:
+        """Return a bounded, rotating batch of evictable keys.
+
+        ``cursor`` is an insertion-order offset returned by the previous call.
+        The scan wraps once and inspects at most ``scan_limit`` entries, so a
+        periodic backup cannot materialize the complete L1 keyspace while the
+        manager lock is held. Concurrent insertions or removals may shift the
+        offset, but every returned key is revalidated by ``reserve_read``.
+
+        Args:
+            limit: Maximum number of keys to return.
+            cursor: Insertion-order offset at which to resume scanning.
+            scan_limit: Maximum entries to inspect. Defaults to four batches.
+
+        Returns:
+            A pair of the eligible keys and the cursor for the next call.
+        """
+        if limit <= 0 or not self._objects:
+            return [], 0
+
+        object_count = len(self._objects)
+        start = cursor % object_count
+        max_scan = min(
+            object_count,
+            max(limit, scan_limit if scan_limit is not None else limit * 4),
+        )
+        ordered_keys = chain(
+            islice(self._objects, start, None),
+            islice(self._objects, 0, start),
+        )
+        keys: list[ObjectKey] = []
+        scanned = 0
+        for key in ordered_keys:
+            scanned += 1
+            if self.is_key_evictable(key):
+                keys.append(key)
+                if len(keys) >= limit:
+                    break
+            if scanned >= max_scan:
+                break
+        return keys, (start + scanned) % object_count
+
+    @l1_mgr_synchronized
+    def num_objects(self) -> int:
+        """Return the number of objects currently tracked in L1."""
+        return len(self._objects)
 
     def is_key_evictable(self, key: ObjectKey) -> bool:
         """Check if a key is eligible for eviction (not locked).

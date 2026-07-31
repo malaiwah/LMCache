@@ -1173,8 +1173,11 @@ class LMCacheMPWorkerAdapter:
         self.store_events: dict[str, list[_IpcEvent]] = {}
         self.retrieve_events: dict[str, _IpcEvent] = {}
 
-        # Block IDs that failed due to retrieve timeout
+        # Block IDs of failed retrieves (timeout, server-reported failure,
+        # or raising future), consumed by get_block_ids_with_load_errors().
         self.error_block_ids: set[int] = set()
+        # Total failed retrieves on this worker, for log-based diagnostics.
+        self.retrieve_failure_count: int = 0
 
         # Retrieve request ids dropped by the unhealthy early-return of
         # submit_retrieve_request. get_finished must still report each id
@@ -1657,6 +1660,9 @@ class LMCacheMPWorkerAdapter:
             - The second set contains the finished retrieve request ids,
                 including retrieves dropped at submit time while unhealthy
                 (reported exactly once; blocks already in error_block_ids).
+                A failed retrieve (server result False or a raising future)
+                is reported finished with its block ids recorded in
+                error_block_ids so the scheduler recomputes them.
 
         Notes:
             When enabling async scheduling in vLLM, the same request ID may appear
@@ -1701,19 +1707,45 @@ class LMCacheMPWorkerAdapter:
 
         finished_stores = self._poll_store_futures()
         finished_retrieves = set()
-        for request_id, (r_future, _) in self.retrieve_futures.items():
+        for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
             if not r_future.query():
                 continue
 
-            r_result = r_future.result()
+            try:
+                r_result = r_future.result()
+            except Exception as exc:
+                # A raising future must not propagate out of get_finished
+                # (that would kill the engine step); contain it as a failed
+                # retrieve on the standard failure path.
+                logger.error(
+                    "LMCache retrieve future raised for request_id=%s: %r "
+                    "-- treating as failed retrieve.",
+                    request_id,
+                    exc,
+                )
+                r_result = False
             finished_retrieves.add(request_id)
 
             if not r_result:
+                # Surface the failure to the scheduler. Reporting the
+                # request finished without recording the failed span would
+                # ACK the load as successful: the request then decodes over
+                # never-written GPU blocks and the phantom blocks enter the
+                # shared prefix cache. error_block_ids feeds
+                # get_block_ids_with_load_errors() ->
+                # kv_connector_output.invalid_block_ids -> scheduler
+                # recompute. The MP server collapses per-key results into
+                # one bool, so marking the op's whole span is
+                # conservative-correct for partial failures too.
+                self.error_block_ids.update(r_block_ids)
+                self.retrieve_failure_count += 1
                 logger.error(
-                    "Something went wrong when processing the "
-                    "retrieve request for request_id=%s, result=%s",
+                    "LMCache retrieve failed for request_id=%s: %d block(s) "
+                    "marked invalid for scheduler recompute "
+                    "(total retrieve failures this worker: %d)",
                     request_id,
-                    r_result,
+                    len(r_block_ids),
+                    self.retrieve_failure_count,
                 )
 
         # Store futures and events are removed together by _poll_store_futures.
@@ -1758,8 +1790,8 @@ class LMCacheMPWorkerAdapter:
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
-        Returns the block IDs that failed due to retrieve timeout,
-        then clears the internal set.
+        Returns the block IDs of failed retrieves (timeout, server-reported
+        failure, or raising future), then clears the internal set.
         """
         errors = self.error_block_ids.copy()
         self.error_block_ids.clear()

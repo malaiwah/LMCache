@@ -55,6 +55,9 @@ from lmcache.v1.platform import (
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.distributed.storage_controllers.eviction_controller import (
+        L1EvictionController,
+    )
     from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)
@@ -119,6 +122,17 @@ def trim_load_plan_with_mask(
             continue
         trimmed_plan[adapter_idx] = new_bitmap
     return trimmed_plan
+
+
+def _layout_nbytes(layout_desc: MemoryLayoutDesc) -> int:
+    """Return the byte size of one object with the given layout."""
+    total = 0
+    for shape, dtype in zip(layout_desc.shapes, layout_desc.dtypes, strict=True):
+        numel = 1
+        for dim in shape:
+            numel *= int(dim)
+        total += numel * dtype.itemsize
+    return total
 
 
 # Poll timeout in milliseconds for the prefetch loop
@@ -226,6 +240,11 @@ class PrefetchController(StorageControllerInterface):
         }
         self._policy = policy
         self._max_in_flight = max_in_flight
+
+        # Optional L1 eviction controller for emergency make-room before
+        # large restores; injected by StorageManager when
+        # EvictionConfig.emergency_evict_for_prefetch is enabled.
+        self._l1_eviction_controller: "L1EvictionController | None" = None
 
         # Adapters that are being drained and will be removed after all
         # the in-flight operations are done.
@@ -847,6 +866,25 @@ class PrefetchController(StorageControllerInterface):
     # =========================================================================
     # Load phase
     # =========================================================================
+    def _select_l1_retentions(
+        self,
+        request_id: int,
+        keys: list[ObjectKey],
+    ) -> list[bool]:
+        """Return one retention decision per key, degrading safely on a
+        malformed policy result."""
+        retentions = self._policy.select_l1_retentions(keys)
+        if len(retentions) != len(keys):
+            logger.error(
+                "Prefetch request %d: policy returned %d retentions for "
+                "%d keys; defaulting to temporary entries",
+                request_id,
+                len(retentions),
+                len(keys),
+            )
+            return [False] * len(keys)
+        return retentions
+
     def _transition_to_load_phase(self, request: InFlightPrefetchRequest) -> None:
         """Compute load plan, reserve L1 buffers, and submit load tasks."""
         request.phase = PrefetchPhase.PLAN_AND_LOAD
@@ -899,15 +937,23 @@ class PrefetchController(StorageControllerInterface):
         if request.mode is PrefetchMode.WARM:
             retentions = [True] * len(keys_to_reserve)
         else:
-            retentions = self._policy.select_l1_retentions(
+            retentions = self._select_l1_retentions(
+                request.request_id,
                 keys_to_reserve,
             )
+            # Non-WARM only: a WARM warm-up must never trigger emergency
+            # eviction of other sessions' chunks.
+            self._make_room_for_restore(request, keys_to_reserve)
         write_results = l1_mgr.reserve_write(
             keys=keys_to_reserve,
             is_temporary=[not r for r in retentions],
             layout_desc=request.layout_desc,
             mode="new",
         )
+        if request.mode is not PrefetchMode.WARM:
+            write_results = self._retry_oom_reservations(
+                request, keys_to_reserve, retentions, write_results
+            )
 
         # Step 4: filter to successfully reserved keys
         reserved_key_set: set[ObjectKey] = set()
@@ -1037,6 +1083,123 @@ class PrefetchController(StorageControllerInterface):
             len(trimmed_plan),
             len(reserved_key_set),
         )
+
+    def set_l1_eviction_controller(
+        self,
+        controller: "L1EvictionController | None",
+    ) -> None:
+        """Enable emergency L1 eviction for large restores.
+
+        With a controller injected, a non-WARM restore that would not fit
+        in free L1 space synchronously evicts LRU keys (write-back first)
+        before reserving, and retries OOM reservations once. Pass ``None``
+        after the last synchronous L2 adapter is removed to disable this path.
+        """
+        self._l1_eviction_controller = controller
+
+    # Never let a single restore claim more than this fraction of L1: a
+    # huge context must not wipe every hot chunk of the running sessions.
+    _EMERGENCY_EVICT_MAX_L1_FRACTION = 0.6
+    # Headroom per object for alignment and allocator bookkeeping.
+    _PER_OBJECT_HEADROOM_BYTES = 8192
+
+    def _make_room_for_restore(
+        self,
+        request: InFlightPrefetchRequest,
+        keys_to_reserve: list[ObjectKey],
+    ) -> None:
+        """Pre-evict LRU L1 chunks so the upcoming reserve_write for this
+        restore can succeed. No-op unless an eviction controller was
+        injected via ``set_l1_eviction_controller``."""
+        evictor = self._l1_eviction_controller
+        if evictor is None or not keys_to_reserve:
+            return
+        per_obj = _layout_nbytes(request.layout_desc)
+        if per_obj <= 0:
+            return
+        used, total = self._l1_manager.get_memory_usage()
+        need = (per_obj + self._PER_OBJECT_HEADROOM_BYTES) * len(keys_to_reserve)
+        need = min(need, int(total * self._EMERGENCY_EVICT_MAX_L1_FRACTION))
+        free = max(0, total - used)
+        if free >= need:
+            return
+        try:
+            evictor.emergency_evict_bytes(
+                need, requester=f"prefetch_request={request.request_id}"
+            )
+        except Exception:
+            logger.exception(
+                "Emergency eviction failed for prefetch request %d",
+                request.request_id,
+            )
+
+    def _retry_oom_reservations(
+        self,
+        request: InFlightPrefetchRequest,
+        keys_to_reserve: list[ObjectKey],
+        retentions: list[bool],
+        write_results: dict[ObjectKey, tuple[L1Error, "MemoryObj | None"]],
+    ) -> dict[ObjectKey, tuple[L1Error, "MemoryObj | None"]]:
+        """One retry round for keys whose reservation failed with
+        OUT_OF_MEMORY: evict the missing amount, reserve just those keys
+        again, and merge the results. No-op unless an eviction controller
+        was injected."""
+        evictor = self._l1_eviction_controller
+        if evictor is None:
+            return write_results
+        oom_keys: list[ObjectKey] = []
+        retention_by_key = dict(zip(keys_to_reserve, retentions, strict=True))
+        for key in keys_to_reserve:
+            entry = write_results.get(key)
+            if entry is None:
+                oom_keys.append(key)
+                continue
+            err, mem_obj = entry
+            if err == L1Error.OUT_OF_MEMORY or (
+                err == L1Error.SUCCESS and mem_obj is None
+            ):
+                oom_keys.append(key)
+        if not oom_keys:
+            return write_results
+        per_obj = _layout_nbytes(request.layout_desc)
+        if per_obj <= 0:
+            return write_results
+        _, total = self._l1_manager.get_memory_usage()
+        need = (per_obj + self._PER_OBJECT_HEADROOM_BYTES) * len(oom_keys)
+        need = min(need, int(total * self._EMERGENCY_EVICT_MAX_L1_FRACTION))
+        try:
+            evictor.emergency_evict_bytes(
+                need, requester=f"prefetch_request={request.request_id}/retry"
+            )
+        except Exception:
+            logger.exception(
+                "Emergency eviction retry failed for prefetch request %d",
+                request.request_id,
+            )
+            return write_results
+        retry_results = self._l1_manager.reserve_write(
+            keys=oom_keys,
+            is_temporary=[not retention_by_key[k] for k in oom_keys],
+            layout_desc=request.layout_desc,
+            mode="new",
+        )
+        recovered = sum(
+            1
+            for k in oom_keys
+            if retry_results.get(k)
+            and retry_results[k][0] == L1Error.SUCCESS
+            and retry_results[k][1] is not None
+        )
+        if recovered:
+            logger.info(
+                "Retry recovered %d/%d OOM reservations for prefetch request %d",
+                recovered,
+                len(oom_keys),
+                request.request_id,
+            )
+        merged = dict(write_results)
+        merged.update(retry_results)
+        return merged
 
     def _update_lookup_results(
         self, request_id: PrefetchRequestId, prefix_hit_count: int
@@ -1181,6 +1344,17 @@ class PrefetchController(StorageControllerInterface):
         # added once the serde PR lands and adapters can distinguish
         # deserialization errors from missing objects.
         if failed_keys:
+            # These keys were reported present by the L2 lookup but the load
+            # returned no data. Sample a few so the on-disk state can be
+            # inspected post hoc.
+            logger.warning(
+                "Prefetch request %d: %d/%d plan keys failed to load from "
+                "L2 (lookup hit, load empty); sample: %s",
+                request.request_id,
+                len(failed_keys),
+                len(request.write_reserved_keys),
+                [str(k)[:160] for k in failed_keys[:3]],
+            )
             self._event_bus.publish(
                 Event(
                     event_type=EventType.L2_PREFETCH_FAILED,

@@ -111,6 +111,9 @@ class ConnectorBase : public IStorageConnector {
     auto [batch_future_id, batch_state, num_tiles, tile_size] =
         prepare_batch_operation(num_items, Op::BATCH_TILE_SET);
 
+    // pre-allocate per-key results so partial store failures are visible
+    batch_state->per_key_results.assign(num_items, 0);
+
     // fan out work to threads
     for (size_t tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
       auto tile_req = create_tile_request(
@@ -326,10 +329,30 @@ class ConnectorBase : public IStorageConnector {
       }
     }
   }
+  // Records a per-key result for every key in the tile (continuing past
+  // failures instead of aborting the tile), then rethrows so batch-level
+  // ok=false semantics are preserved for consumers that ignore per-key
+  // results.
   virtual void do_batch_set(ConnectionType& conn, const Request& req) {
+    bool any_failed = false;
+    std::string first_error;
     for (size_t i = 0; i < req.keys.size(); ++i) {
-      do_single_set(conn, req.keys[i], req.buf_ptrs[i], req.buf_lens[i],
-                    req.batch_chunk_num_bytes);
+      try {
+        do_single_set(conn, req.keys[i], req.buf_ptrs[i], req.buf_lens[i],
+                      req.batch_chunk_num_bytes);
+        req.batch->per_key_results[req.start_idx + i] = 1;
+      } catch (const std::exception& e) {
+        req.batch->per_key_results[req.start_idx + i] = 0;
+        if (!any_failed) {
+          any_failed = true;
+          first_error = e.what();
+        }
+        fprintf(stderr, "[LMCache SET] key %s failed: %s\n",
+                req.keys[i].c_str(), e.what());
+      }
+    }
+    if (any_failed) {
+      throw std::runtime_error("batch set partially failed: " + first_error);
     }
   }
   virtual void do_batch_exists(ConnectionType& conn, const Request& req) {
@@ -612,9 +635,10 @@ class ConnectorBase : public IStorageConnector {
         std::lock_guard<std::mutex> lk(req.batch->err_mu);
         batch_comp.error = req.batch->first_error;
       }
-      // for batch exists and batch get, move per-key results
+      // move per-key results for every op that records them
       if (req.batch->batch_op == Op::BATCH_TILE_EXISTS ||
           req.batch->batch_op == Op::BATCH_TILE_GET ||
+          req.batch->batch_op == Op::BATCH_TILE_SET ||
           req.batch->batch_op == Op::BATCH_TILE_DELETE) {
         batch_comp.result_bytes = std::move(req.batch->per_key_results);
       }

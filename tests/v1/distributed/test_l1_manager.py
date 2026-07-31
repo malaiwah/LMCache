@@ -132,18 +132,6 @@ def basic_layout():
     )
 
 
-@pytest.fixture
-def large_layout():
-    """Create a large MemoryLayoutDesc that will exhaust small memory.
-
-    Each allocation is 8MB (2M elements * 4 bytes).
-    """
-    return MemoryLayoutDesc(
-        shapes=[torch.Size([2048, 1024])],  # 2M elements * 4 bytes = 8MB
-        dtypes=[torch.float32],
-    )
-
-
 def make_object_key(chunk_hash: int, model_name: str = "test_model", kv_rank: int = 0):
     """Helper to create ObjectKey instances."""
     hash_bytes = ObjectKey.IntHash2Bytes(chunk_hash)
@@ -879,14 +867,23 @@ class TestReserveWrite:
 
         manager.close()
 
-    def test_reserve_write_out_of_memory(self, small_l1_config, large_layout):
-        """Test that reserve_write returns OUT_OF_MEMORY when allocation fails."""
+    def test_reserve_write_out_of_memory(self, small_l1_config):
+        """Test that reserve_write returns OUT_OF_MEMORY when allocation fails.
+
+        Uses an object larger than the whole pool; a batch that partially
+        fits allocates the longest prefix instead (see
+        tests/v1/distributed/test_l1_manager_partial_alloc.py).
+        """
         manager = L1Manager(small_l1_config)
         keys = [make_object_key(i) for i in range(10)]
         is_temporary = [False] * 10
 
-        # Request more memory than available (8MB * 10 = 80MB > 64MB)
-        result = manager.reserve_write(keys, is_temporary, large_layout)
+        # A single object (128MB) exceeds the 64MB pool.
+        oversized_layout = MemoryLayoutDesc(
+            shapes=[torch.Size([2048 * 16, 1024])],
+            dtypes=[torch.float32],
+        )
+        result = manager.reserve_write(keys, is_temporary, oversized_layout)
 
         # All keys should return OUT_OF_MEMORY
         for key in keys:

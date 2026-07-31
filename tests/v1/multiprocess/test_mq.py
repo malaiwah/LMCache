@@ -21,6 +21,7 @@ from lmcache.v1.multiprocess.mq import (
     BlockingRequestHandler,
     MessageQueueClient,
     MessageQueueServer,
+    RemoteHandlerError,
 )
 from lmcache.v1.multiprocess.protocol import (
     RequestType,
@@ -680,6 +681,58 @@ def test_shared_loop_dispatch():
         client_b.close()
         assert ClientPollingLoop._instance is None
     finally:
+        server.close()
+
+
+def test_sync_handler_failure_completes_future_and_loop_recovers():
+    context = zmq.Context.instance()
+    server = MessageQueueServer("tcp://127.0.0.1:16021", context)
+    add_handler_helper(
+        server, RequestType.NOOP, test_mq_handler_helpers.failing_noop_handler
+    )
+    server.start()
+    client = MessageQueueClient("tcp://127.0.0.1:16021", context)
+
+    try:
+        failed = client.submit_request(RequestType.NOOP, [])
+        with pytest.raises(
+            RemoteHandlerError, match="intentional sync handler failure"
+        ) as exc_info:
+            failed.result(timeout=2)
+        assert exc_info.value.request_type is RequestType.NOOP
+        assert exc_info.value.error_type == "ValueError"
+
+        server.add_sync_handler(
+            RequestType.NOOP, [], test_mq_handler_helpers.noop_handler
+        )
+        assert (
+            client.submit_request(RequestType.NOOP, []).result(timeout=2) == "NOOP_OK"
+        )
+    finally:
+        client.close()
+        server.close()
+
+
+def test_blocking_handler_failure_completes_future():
+    context = zmq.Context.instance()
+    server = MessageQueueServer("tcp://127.0.0.1:16022", context)
+    add_handler_helper(
+        server, RequestType.LOOKUP, test_mq_handler_helpers.failing_lookup_handler
+    )
+    server.add_normal_thread_pool([RequestType.LOOKUP], max_workers=1)
+    server.start()
+    client = MessageQueueClient("tcp://127.0.0.1:16022", context)
+
+    try:
+        future = client.submit_request(RequestType.LOOKUP, [create_cache_key(1), 1])
+        with pytest.raises(
+            RemoteHandlerError, match="intentional blocking handler failure"
+        ) as exc_info:
+            future.result(timeout=2)
+        assert exc_info.value.request_type is RequestType.LOOKUP
+        assert exc_info.value.error_type == "OSError"
+    finally:
+        client.close()
         server.close()
 
 

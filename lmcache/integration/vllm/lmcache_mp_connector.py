@@ -464,6 +464,42 @@ class LMCacheMPRequestMetadata:
             "number of LMCache hit tokens. "
         )
         if end_token_idx > start_token_idx:
+            # allocated_block_ids must cover [start_token_idx, end_token_idx)
+            # in every engine group. slice_block_ids_per_group() validates
+            # chunk alignment only; its plain Python slice truncates
+            # silently, so a tracker primed with LMCache hit counts on a
+            # scheduling pass whose allocation never materialised would emit
+            # a retrieve op with too few block ids. The MP server fails
+            # closed on the short list, wasting a doomed round-trip and
+            # relying on the failure being surfaced at all. Suppress the op
+            # instead so the request recomputes cleanly. Never clamp
+            # end_token_idx: a clamped retrieve completes a load vLLM does
+            # not expect and re-creates the desync downstream.
+            # One allocated id of group g covers group_tokens_per_block[g]
+            # global token positions (KV-spec block_size, DCP-scaled), the
+            # same arithmetic GetStoreMetadata uses to bound its
+            # allocated_tokens.
+            for group_idx, tokens_per_block in enumerate(group_tokens_per_block):
+                allocated = len(tracker.allocated_block_ids.get(group_idx, []))
+                if allocated * tokens_per_block < end_token_idx:
+                    logger.warning(
+                        "LMCache retrieve suppressed for request_id=%s: "
+                        "engine group %d has %d allocated block(s) x %d "
+                        "tokens/block = %d tokens < end_token_idx=%d "
+                        "(start_token_idx=%d, vllm_hit_tokens=%d, "
+                        "lmcache_hit_tokens=%d) -- tracker/allocation "
+                        "desync; falling back to recompute.",
+                        tracker.request_id,
+                        group_idx,
+                        allocated,
+                        tokens_per_block,
+                        allocated * tokens_per_block,
+                        end_token_idx,
+                        start_token_idx,
+                        tracker.num_vllm_hit_tokens,
+                        tracker.num_lmcache_hit_tokens,
+                    )
+                    return None
             block_ids = slice_block_ids_per_group(
                 tracker.allocated_block_ids,
                 group_tokens_per_block,
