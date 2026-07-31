@@ -3,14 +3,11 @@
 """Unit tests for the device-type-driven dispatch in
 ``lmcache.v1.platform.cache_context.create_cache_context``.
 
-The facade routes by the ``torch.device.type`` reported by the
-wrappers' ``to_tensor()`` output and looks up the registered cache
-context class via :mod:`lmcache.v1.platform.cache_context`. These tests
-exercise that dispatch without touching CUDA or the real
-``GPUCacheContext`` / ``CPUCacheContext`` constructors -- they
-install fake classes in the backend table through
-``snapshot_backends``/``restore_backends`` so the test stays
-platform-agnostic.
+The facade routes built-in wrappers by class-level ``device_type`` metadata,
+with a ``to_tensor().device.type`` fallback for legacy third-party wrappers,
+then looks up the registered context class. These tests exercise both paths
+without touching CUDA or the real ``GPUCacheContext`` / ``CPUCacheContext``
+constructors.
 """
 
 # Standard
@@ -27,11 +24,10 @@ from lmcache.v1.platform.cache_context import create_cache_context
 
 
 class _FakeWrapper:
-    """Minimal stand-in for a KV-cache IPC wrapper.
+    """Legacy stand-in without class-level device metadata.
 
-    ``create_cache_context`` only ever reads ``to_tensor().device.type``
-    from the wrappers it receives, so a 0-byte tensor on the requested
-    device is enough.
+    A 0-byte tensor on the requested device exercises the compatibility
+    fallback used for third-party wrappers.
     """
 
     def __init__(self, device_type: str) -> None:
@@ -39,6 +35,15 @@ class _FakeWrapper:
 
     def to_tensor(self) -> torch.Tensor:
         return torch.empty(0, device=torch.device(self._device_type))
+
+
+class _DeclaredWrapper:
+    """Built-in-style wrapper whose device metadata avoids handle import."""
+
+    device_type = "cpu"
+
+    def to_tensor(self) -> torch.Tensor:
+        raise AssertionError("device dispatch must not consume the IPC export")
 
 
 class _FakeContext(BaseCacheContext):
@@ -154,6 +159,19 @@ def test_dispatches_by_cpu_device_type(isolated_registry: None) -> None:
     _install(cpu=_FakeCPUContext)
 
     wrappers: List[_FakeWrapper] = [_FakeWrapper("cpu"), _FakeWrapper("cpu")]
+    ctx = create_cache_context(wrappers)  # type: ignore[arg-type]
+
+    assert isinstance(ctx, _FakeCPUContext)
+    assert ctx.kv_caches is wrappers
+
+
+def test_declared_device_type_does_not_materialize_wrapper(
+    isolated_registry: None,
+) -> None:
+    """Built-in wrapper metadata must preserve its one-shot import for backend use."""
+    _install(cpu=_FakeCPUContext)
+    wrappers = [_DeclaredWrapper()]
+
     ctx = create_cache_context(wrappers)  # type: ignore[arg-type]
 
     assert isinstance(ctx, _FakeCPUContext)

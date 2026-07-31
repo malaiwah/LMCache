@@ -15,6 +15,7 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocol import KeyType
+from lmcache.v1.platform.base_ipc_wrapper import release_ipc_exports
 
 # ==============================================================================
 # NOOP Request Handlers
@@ -65,7 +66,10 @@ def register_kv_cache_handler(
         None
     """
     # In a real implementation, this would register the KV cache
-    # For testing, we just validate the inputs are received correctly
+    # For testing, release the one-shot exports without importing them, then
+    # validate the inputs. This mirrors the production NOOP ownership path and
+    # prevents the fixture itself from leaking producer refcounts.
+    release_ipc_exports(kv_cache)
     assert isinstance(gpu_id, int), f"Expected gpu_id to be int, got {type(gpu_id)}"
     assert isinstance(kv_cache, list), (
         f"Expected kv_cache to be list, got {type(kv_cache)}"

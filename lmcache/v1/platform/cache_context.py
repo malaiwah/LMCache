@@ -142,11 +142,19 @@ def restore_backends(state: dict[str, type]) -> None:
 def _detect_device_type(kv_caches: KVCache) -> str:
     """Return the ``torch.device.type`` describing *kv_caches*.
 
-    All wrappers in *kv_caches* must materialize tensors on the same
-    device type; mixed-device batches are not supported by any
-    downstream cache-context implementation.
+    Built-in wrappers expose a class-level ``device_type`` so dispatch does
+    not consume a one-shot IPC export merely to inspect it. Third-party
+    wrappers without that metadata retain the legacy ``to_tensor`` fallback.
+    Mixed-device batches are not supported by downstream cache contexts.
     """
-    device_types = {w.to_tensor().device.type for w in kv_caches}
+    device_types: set[str] = set()
+    for wrapper in kv_caches:
+        declared_type = getattr(type(wrapper), "device_type", "")
+        device_types.add(
+            declared_type
+            if isinstance(declared_type, str) and declared_type
+            else wrapper.to_tensor().device.type
+        )
     if len(device_types) != 1:
         raise ValueError(
             "create_cache_context requires all kv_caches to share one "

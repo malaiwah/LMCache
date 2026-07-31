@@ -5,9 +5,10 @@ from types import SimpleNamespace
 from typing import Any, Callable
 from unittest.mock import MagicMock
 import gc
+import itertools
 import multiprocessing as mp
-import sys
 import queue
+import sys
 import threading
 import time
 import weakref
@@ -36,15 +37,110 @@ from lmcache.v1.multiprocess.protocol import (
     get_payload_classes,
 )
 from lmcache.v1.multiprocess.server import add_handler_helper
+from lmcache.v1.platform.base_ipc_wrapper import DeviceIPCWrapper
 from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
-import lmcache.v1.multiprocess.mq as mq_mod
 
 # Test helpers
 from tests.v1.multiprocess import test_mq_handler_helpers
+import lmcache.v1.multiprocess.mq as mq_mod
 
 # ==============================================================================
 # MessageQueueServer and MessageQueueClient Tests Infrastructure
 # ==============================================================================
+
+
+class _TrackedIPCWrapper(DeviceIPCWrapper):
+    """CPU-only ownership probe for MQ send and teardown paths."""
+
+    def __init__(self) -> None:
+        self.state = "unconsumed"
+        self.release_calls = 0
+        self.transfer_calls = 0
+
+    def release_ipc_export(self) -> bool:
+        if self.state != "unconsumed":
+            return False
+        self.state = "released"
+        self.release_calls += 1
+        return True
+
+    def mark_ipc_export_transferred(self) -> bool:
+        if self.state != "unconsumed":
+            return False
+        self.state = "transferred"
+        self.transfer_calls += 1
+        return True
+
+
+def test_handler_exception_releases_unconsumed_ipc_export() -> None:
+    """Handler failures cannot orphan already-decoded one-shot exports."""
+    wrapper = _TrackedIPCWrapper()
+
+    def fail(_wrapper: _TrackedIPCWrapper) -> None:
+        raise RuntimeError("handler failed")
+
+    with pytest.raises(RuntimeError, match="handler failed"):
+        mq_mod._invoke_handler_with_ipc_cleanup(fail, [wrapper])
+
+    assert wrapper.release_calls == 1
+    assert wrapper.transfer_calls == 0
+
+
+def test_later_decode_failure_releases_earlier_ipc_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Partial request decoding cannot orphan an already-created receiver."""
+    wrapper = _TrackedIPCWrapper()
+    decoded = iter([wrapper, ValueError("malformed second payload")])
+
+    def decode(_payload: bytes, *, cls: type[Any]) -> Any:
+        value = next(decoded)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(mq_mod, "msgspec_decode", decode)
+
+    with pytest.raises(ValueError, match="malformed second payload"):
+        mq_mod.unwrap_request_payloads([b"wrapper", b"broken"], [DeviceIPCWrapper, str])
+
+    assert wrapper.release_calls == 1
+    assert wrapper.transfer_calls == 0
+
+
+def test_blocking_submit_failure_releases_decoded_ipc_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Executor rejection leaves ownership with the server dispatch thread."""
+    wrapper = _TrackedIPCWrapper()
+    handler = BlockingRequestHandler([DeviceIPCWrapper], str, lambda _wrapper: "ok")
+    handler.executor = MagicMock()
+    handler.executor.submit.side_effect = RuntimeError("executor stopped")
+    monkeypatch.setattr(mq_mod, "unwrap_request_payloads", lambda *_args: [wrapper])
+
+    with pytest.raises(RuntimeError, match="executor stopped"):
+        handler([b"wrapper"])
+
+    assert wrapper.release_calls == 1
+    assert wrapper.transfer_calls == 0
+
+
+def test_register_fixture_releases_unconsumed_ipc_export() -> None:
+    """The CUDA REGISTER fixture must not be the producer-refcount owner."""
+    wrapper = _TrackedIPCWrapper()
+
+    test_mq_handler_helpers.register_kv_cache_handler(
+        0,
+        [wrapper],
+        "model",
+        1,
+        EngineType.VLLM,
+        {},
+        [],
+    )
+
+    assert wrapper.release_calls == 1
+    assert wrapper.transfer_calls == 0
 
 
 def create_cache_key(index: int, model: str = "testmodel") -> IPCCacheServerKey:
@@ -772,12 +868,15 @@ def test_timeout_before_send_releases_transport_resources_without_sending() -> N
 
     client = MessageQueueClient.__new__(MessageQueueClient)
     client.input_queue = queue.Queue()
-    client._request_counter = iter([21])
+    client._request_counter = itertools.count(21)
     client.pending_futures = {}
     client._polling_loop = MagicMock()
     client.socket = MagicMock()
 
-    future = client.submit_request(RequestType.NOOP, [])
+    wrapper = _TrackedIPCWrapper()
+    future: mq_mod.MessagingFuture[Any] = client.submit_request(
+        RequestType.NOOP, [wrapper]
+    )
     resource = _Resource()
     resource_ref = weakref.ref(resource)
     future.retain_until_transport_complete(resource)
@@ -794,7 +893,64 @@ def test_timeout_before_send_releases_transport_resources_without_sending() -> N
     assert future.transport_complete
     assert resource_ref() is None
     assert client.pending_futures == {}
+    assert wrapper.release_calls == 1
+    assert wrapper.transfer_calls == 0
     client.socket.send_multipart.assert_not_called()
+
+
+def test_successful_send_transfers_ipc_export_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An atomic socket send makes the receiver the sole export owner."""
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.input_queue = queue.Queue()
+    client._request_counter = itertools.count(22)
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    client.socket = MagicMock()
+    wrapper = _TrackedIPCWrapper()
+    monkeypatch.setattr(
+        mq_mod, "get_payload_classes", lambda _request_type: [DeviceIPCWrapper]
+    )
+    monkeypatch.setattr(mq_mod, "msgspec_encode", lambda *_args, **_kwargs: b"encoded")
+
+    future: mq_mod.MessagingFuture[Any] = client.submit_request(
+        RequestType.NOOP, [wrapper]
+    )
+    client.process_outbound_task()
+
+    assert client.pending_futures == {22: future}
+    assert wrapper.transfer_calls == 1
+    assert wrapper.release_calls == 0
+
+
+def test_failed_send_releases_ipc_export_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request rejected by ZeroMQ never transfers its export reservation."""
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.input_queue = queue.Queue()
+    client._request_counter = itertools.count(23)
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    client.socket = MagicMock()
+    client.socket.send_multipart.side_effect = zmq.Again()
+    wrapper = _TrackedIPCWrapper()
+    monkeypatch.setattr(
+        mq_mod, "get_payload_classes", lambda _request_type: [DeviceIPCWrapper]
+    )
+    monkeypatch.setattr(mq_mod, "msgspec_encode", lambda *_args, **_kwargs: b"encoded")
+
+    future: mq_mod.MessagingFuture[Any] = client.submit_request(
+        RequestType.NOOP, [wrapper]
+    )
+    client.process_outbound_task()
+
+    with pytest.raises(RuntimeError, match="send queue is full"):
+        future.result()
+    assert client.pending_futures == {}
+    assert wrapper.release_calls == 1
+    assert wrapper.transfer_calls == 0
 
 
 @pytest.mark.parametrize("teardown", ["reset", "close"])
@@ -865,11 +1021,12 @@ def test_connection_reset_discards_stale_pending_and_unsent_work() -> None:
     client.pending_futures = {}
     client.input_queue = queue.Queue()
 
-    pending = mq_mod.MessagingFuture()
-    unsent = mq_mod.MessagingFuture()
+    pending: mq_mod.MessagingFuture[Any] = mq_mod.MessagingFuture()
+    unsent: mq_mod.MessagingFuture[Any] = mq_mod.MessagingFuture()
+    unsent_wrapper = _TrackedIPCWrapper()
     client.pending_futures[3] = pending
     client.input_queue.put(
-        MessageQueueClient.WrappedRequest(4, unsent, RequestType.NOOP, [])
+        MessageQueueClient.WrappedRequest(4, unsent, RequestType.NOOP, [unsent_wrapper])
     )
     loop._socket_to_client = {old_socket: client}
 
@@ -879,6 +1036,8 @@ def test_connection_reset_discards_stale_pending_and_unsent_work() -> None:
         pending.result()
     with pytest.raises(ConnectionError, match="became unhealthy"):
         unsent.result()
+    assert unsent_wrapper.release_calls == 1
+    assert unsent_wrapper.transfer_calls == 0
     old_socket.close.assert_called_once_with(linger=0)
     new_socket.setsockopt.assert_any_call(zmq.SNDHWM, mq_mod._CLIENT_SNDHWM)
     new_socket.setsockopt.assert_any_call(zmq.LINGER, 0)

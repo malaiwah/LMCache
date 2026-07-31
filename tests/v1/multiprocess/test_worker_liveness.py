@@ -74,19 +74,45 @@ def test_gpu_register_inserts_unlatched_entry(monkeypatch) -> None:
 
 def test_gpu_noop_register_refreshes_without_latching(monkeypatch) -> None:
     """Re-registering a known instance refreshes last_seen but does not
-    rebuild the context or latch the ping-proven flag."""
+    rebuild the context, latch the ping-proven flag, or leak fresh exports."""
     create = MagicMock(return_value=MagicMock(num_layers=2))
+    release = MagicMock()
     monkeypatch.setattr(gpu_mod, "create_cache_context", create)
     monkeypatch.setattr(gpu_mod, "get_layout_desc", lambda *a, **kw: MagicMock())
+    monkeypatch.setattr(gpu_mod, "release_ipc_exports", release)
     module = _bare_gpu_module()
     module.register_kv_cache(1, MagicMock(), "model", 1, MagicMock(), MagicMock(), [])
     module._cache_contexts[1].last_seen = 0.0
+    release.reset_mock()
+    recovery_exports = MagicMock(name="recovery_exports")
 
-    module.register_kv_cache(1, MagicMock(), "model", 1, MagicMock(), MagicMock(), [])
+    module.register_kv_cache(
+        1, recovery_exports, "model", 1, MagicMock(), MagicMock(), []
+    )
 
     assert create.call_count == 1  # not rebuilt
+    release.assert_called_once_with(recovery_exports)
     assert module._cache_contexts[1].last_seen > 0.0  # refreshed
     assert module._cache_contexts[1].has_liveness_signal is False
+
+
+def test_gpu_register_failure_releases_unconsumed_exports(monkeypatch) -> None:
+    """A rejected initial registration returns every one-shot export."""
+    release = MagicMock()
+    monkeypatch.setattr(
+        gpu_mod,
+        "create_cache_context",
+        MagicMock(side_effect=RuntimeError("context rejected")),
+    )
+    monkeypatch.setattr(gpu_mod, "release_ipc_exports", release)
+    module = _bare_gpu_module()
+    exports = MagicMock(name="exports")
+
+    with pytest.raises(RuntimeError, match="context rejected"):
+        module.register_kv_cache(1, exports, "model", 1, MagicMock(), MagicMock(), [])
+
+    release.assert_called_once_with(exports)
+    assert module.tracked_instance_count() == 0
 
 
 def test_gpu_touch_latches_get_does_not() -> None:

@@ -36,6 +36,7 @@ from lmcache.v1.multiprocess.transfer_context import (
 )
 from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSummary
 from lmcache.v1.platform import resolve_kv_wrapper_factory
+from lmcache.v1.platform.base_ipc_wrapper import release_ipc_exports
 
 logger = init_logger(__name__)
 
@@ -151,11 +152,9 @@ def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
         ),
     )
     logger.info("Wrapping %d KV cache tensors for IPC", len(kv_caches))
-    # Per-iteration resource management: if wrapping the N-th tensor
-    # raises, ``shm_unlink`` whatever earlier iterations already
-    # registered with POSIX SHM so the named segments do not outlive
-    # the failed batch. CUDA wrappers do not own a named segment and
-    # are skipped via the duck-typed ``shm_name`` check.
+    # Per-iteration resource management: if wrapping the N-th tensor raises,
+    # return earlier CUDA export reservations and unlink any POSIX SHM names
+    # so no resource from the rejected batch outlives this call.
     wrappers: KVCache = []
     try:
         for tensor in kv_caches.values():
@@ -167,15 +166,19 @@ def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
 
 
 def _release_partial_kv_wrappers(wrappers: list[Any]) -> None:
-    """Best-effort unlink of SHM segments owned by partially built wrappers.
+    """Best-effort release of a partially built IPC wrapper batch.
 
     Used by :func:`wrap_kv_caches` to roll back a half-finished batch
-    when a later iteration raises. Only POSIX-SHM-backed wrappers carry
-    a ``shm_name`` attribute, so other wrapper kinds (e.g. CUDA-IPC)
-    are silently skipped.
+    when a later iteration raises. CUDA wrappers return their unconsumed
+    PyTorch IPC refcounter; POSIX-SHM-backed wrappers unlink their names.
     """
     # First Party
     from lmcache.v1.multiprocess.posix_shm import shm_unlink
+
+    try:
+        release_ipc_exports(wrappers)
+    except Exception:  # pragma: no cover - best effort
+        logger.debug("CUDA IPC release failed during rollback", exc_info=True)
 
     for w in wrappers:
         name = getattr(w, "shm_name", None)

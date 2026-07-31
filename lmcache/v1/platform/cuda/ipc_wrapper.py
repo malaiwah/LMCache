@@ -17,20 +17,36 @@ TRT-LLM adapter) instantiate it directly.
 from __future__ import annotations
 
 # Standard
-from typing import ClassVar
+from typing import Any, ClassVar, cast
+import threading
 
 # Third Party
 import torch
 
 # First Party
 from lmcache import torch_device_type
+from lmcache.logging import init_logger
 from lmcache.v1.platform.base_ipc_wrapper import DeviceIPCWrapper
+
+logger = init_logger(__name__)
 
 
 class CudaIPCWrapper(DeviceIPCWrapper):
+    """One-shot PyTorch CUDA IPC export with process-local ownership state.
+
+    ``_share_cuda_`` creates one producer-refcount reservation. The receiving
+    process must consume it through :meth:`to_tensor` exactly once or return it
+    through :meth:`release_ipc_export`; repeated calls are idempotent or reuse
+    the cached tensor.
+    """
+
     #: ``torch.device.type`` this wrapper handles. Kept as a class-level
     #: constant so external tooling / tests can introspect the binding.
     device_type: ClassVar[str] = "cuda"
+    _UNCONSUMED: ClassVar[str] = "unconsumed"
+    _IMPORTED: ClassVar[str] = "imported"
+    _RELEASED: ClassVar[str] = "released"
+    _TRANSFERRED: ClassVar[str] = "transferred"
 
     @classmethod
     def wrap(cls, tensor: torch.Tensor) -> "CudaIPCWrapper":
@@ -55,38 +71,183 @@ class CudaIPCWrapper(DeviceIPCWrapper):
         # Permute any non-contiguous view (e.g. vLLM's NHD-over-HND) so the
         # shape/stride we encode across IPC reflects the physical layout.
         # Offset is preserved by the wrapper's storage_offset field.
-        tensor = attempt_permute_to_contiguous_view(tensor)
+        tensor = cast(torch.Tensor, attempt_permute_to_contiguous_view(tensor))
 
         storage = tensor.untyped_storage()
         handle = storage._share_cuda_()
 
         self.handle = handle
-        self.dtype = tensor.dtype
-        self.shape = tuple(tensor.shape)
-        self.stride = tuple(tensor.stride())
-        self.storage_offset = int(tensor.storage_offset())
+        self._initialize_ipc_ownership(auto_release=False)
+        try:
+            self.dtype = tensor.dtype
+            self.shape = tuple(tensor.shape)
+            self.stride = tuple(tensor.stride())
+            self.storage_offset = int(tensor.storage_offset())
 
-        device_index = tensor.device.index
-        self.device_uuid = self._get_device_uuid(device_index)
+            device_index = tensor.device.index
+            self.device_uuid = self._get_device_uuid(device_index)
+        except BaseException:
+            # Once _share_cuda_ succeeds, this constructor owns one producer
+            # reservation even if later metadata discovery fails.
+            self.release_ipc_export()
+            raise
+
+    def _initialize_ipc_ownership(self, *, auto_release: bool) -> None:
+        """Initialize process-local state excluded from the wire payload."""
+        self._ipc_state = self._UNCONSUMED
+        self._ipc_state_lock = threading.Lock()
+        self._cached_tensor: torch.Tensor | None = None
+        # A deserialized receiver owns the reservation and must release it if
+        # the handler never imports it. The sender transfers ownership only
+        # after the atomic transport send succeeds.
+        self._auto_release = auto_release
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Serialize only the CUDA handle metadata, never local ownership state."""
+        with self._ipc_state_lock:
+            if self._ipc_state != self._UNCONSUMED:
+                raise RuntimeError(
+                    "Cannot serialize a CUDA IPC wrapper after its export was "
+                    f"{self._ipc_state}"
+                )
+            return {
+                "handle": self.handle,
+                "dtype": self.dtype,
+                "shape": self.shape,
+                "stride": self.stride,
+                "storage_offset": self.storage_offset,
+                "device_uuid": self.device_uuid,
+            }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore wire metadata and make this process the reservation owner."""
+        self.handle = state["handle"]
+        self.dtype = state["dtype"]
+        self.shape = state["shape"]
+        self.stride = state["stride"]
+        self.storage_offset = state["storage_offset"]
+        self.device_uuid = state["device_uuid"]
+        self._initialize_ipc_ownership(auto_release=True)
+
+    def _import_tensor_from_handle(self) -> torch.Tensor:
+        """Import the one consumer storage represented by this wrapper."""
+        storage: torch.UntypedStorage | None = None
+        try:
+            device_index = self._get_device_index_from_uuid(self.device_uuid)
+            # Allocate the tensor shell before opening the shared storage. If
+            # either step fails before ``storage`` is assigned, no storage
+            # deleter exists and we must return the reservation explicitly.
+            tensor = torch.empty(
+                (), device=f"{torch_device_type}:{device_index}", dtype=self.dtype
+            )
+            storage = self._open_shared_storage(device_index)
+            tensor.set_(storage, self.storage_offset, self.shape, self.stride)
+            return tensor
+        except BaseException:
+            if storage is None:
+                self._release_counter_noexcept()
+            # Once storage exists, its deleter owns the one decrement even if
+            # rebuilding the tensor view fails.
+            raise
+
+    def _open_shared_storage(self, device_index: int) -> torch.UntypedStorage:
+        """Open the CUDA storage and attach its consumer-side refcounter."""
+        return torch.UntypedStorage._new_shared_cuda(  # noqa: SLF001
+            device_index, *self.handle[1:]
+        )
+
+    def _release_counter(self) -> None:
+        """Decrement the producer counter without importing the CUDA storage."""
+        torch.UntypedStorage._release_ipc_counter_cuda(  # noqa: SLF001
+            self.handle[4], self.handle[5]
+        )
+
+    def _release_counter_noexcept(self) -> None:
+        """Best-effort counter release that cannot mask the primary failure."""
+        try:
+            self._release_counter()
+        except Exception:
+            logger.exception("Failed to release CUDA IPC producer refcounter")
 
     def to_tensor(self) -> torch.Tensor:
-        """
+        """Import and cache the single consumer tensor represented by this handle.
+
+        PyTorch initializes each ``_share_cuda_`` refcounter to one. Re-importing
+        the same handle would attach multiple storage deleters to that one
+        reservation and underflow it during teardown, so repeated and concurrent
+        calls return the same process-local tensor.
+
         Note:
             This function may break if the accelerator is not initialized.
             We should call ``torch_dev.init()`` before using this function
             (guarded by hasattr since not all backends expose init()).
+
+        Returns:
+            The imported tensor. Repeated calls return the same object.
+
+        Raises:
+            RuntimeError: If ownership was already released or transferred.
         """
-        device_index = self._get_device_index_from_uuid(self.device_uuid)
+        with self._ipc_state_lock:
+            if self._ipc_state == self._IMPORTED:
+                assert self._cached_tensor is not None
+                return self._cached_tensor
+            if self._ipc_state != self._UNCONSUMED:
+                raise RuntimeError(
+                    "CUDA IPC export is no longer available for import "
+                    f"(state={self._ipc_state})"
+                )
 
-        storage = torch.UntypedStorage._new_shared_cuda(  # noqa: SLF001
-            device_index, *self.handle[1:]
-        )
+            try:
+                tensor = self._import_tensor_from_handle()
+            except BaseException:
+                # _import_tensor_from_handle either returned the reservation
+                # explicitly or attached it to a storage deleter.
+                self._ipc_state = self._RELEASED
+                raise
 
-        t = torch.empty(
-            (), device=f"{torch_device_type}:{device_index}", dtype=self.dtype
-        )
-        t.set_(storage, self.storage_offset, self.shape, self.stride)
-        return t
+            self._cached_tensor = tensor
+            self._ipc_state = self._IMPORTED
+            return tensor
+
+    def release_ipc_export(self) -> bool:
+        """Release this reservation if no consumer tensor was imported.
+
+        Returns:
+            ``True`` for the call that claimed the reservation; ``False`` if
+            another terminal action already won.
+        """
+        with self._ipc_state_lock:
+            if self._ipc_state != self._UNCONSUMED:
+                return False
+            self._ipc_state = self._RELEASED
+            self._release_counter_noexcept()
+            return True
+
+    def mark_ipc_export_transferred(self) -> bool:
+        """Relinquish this process's copy after a successful transport send.
+
+        Returns:
+            ``True`` for the call that transferred ownership; ``False`` if
+            another terminal action already won.
+        """
+        with self._ipc_state_lock:
+            if self._ipc_state != self._UNCONSUMED:
+                return False
+            self._ipc_state = self._TRANSFERRED
+            self._auto_release = False
+            return True
+
+    def __del__(self) -> None:
+        """Best-effort fallback for a receiver that never consumed its handle."""
+        if not getattr(self, "_auto_release", False):
+            return
+        try:
+            self.release_ipc_export()
+        except BaseException:
+            # Destructors run during exception unwinding and interpreter
+            # shutdown; cleanup failures must not mask the primary failure.
+            pass
 
 
 class RawCudaIPCWrapper(DeviceIPCWrapper):

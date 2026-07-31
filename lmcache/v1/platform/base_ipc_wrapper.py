@@ -7,12 +7,18 @@ implementations.  Every concrete wrapper (e.g. :class:`~.cpu.shm.CpuShmTensorWra
 the single msgspec ext code (1) -- pickle preserves the concrete
 subclass identity across the wire so ``to_tensor`` dispatches correctly
 on the receiving side.
+
+Refcounted exports follow a one-shot ownership contract: after export,
+exactly one receiver must either import the handle once or explicitly release
+it. A successful transport send transfers that obligation from sender to
+receiver; failed or abandoned sends leave it with the sender.
 """
 
 # Future
 from __future__ import annotations
 
 # Standard
+from collections.abc import Iterator
 from typing import Any, Tuple
 import pickle
 import threading
@@ -22,6 +28,9 @@ import torch
 
 # First Party
 from lmcache import torch_dev
+from lmcache.logging import init_logger
+
+logger = init_logger(__name__)
 
 
 class DeviceIPCWrapper:
@@ -111,6 +120,30 @@ class DeviceIPCWrapper:
         """
         raise NotImplementedError
 
+    def release_ipc_export(self) -> bool:
+        """Release an exported handle that will not be imported.
+
+        Refcounted transports override this method. The default is a no-op
+        because raw device handles and POSIX-SHM wrappers do not use PyTorch's
+        CUDA IPC refcounter.
+
+        Returns:
+            ``True`` when this call released an export reservation.
+        """
+        return False
+
+    def mark_ipc_export_transferred(self) -> bool:
+        """Mark this process's export copy as owned by the receiver.
+
+        Refcounted transports override this method. After a successful
+        transport send, the sender must not release the same reservation that
+        the receiver will import or explicitly release.
+
+        Returns:
+            ``True`` when ownership changed to the receiver.
+        """
+        return False
+
     def __eq__(self, other: object) -> bool:
         # ``isinstance`` first so type-checkers can narrow ``other`` to
         # ``DeviceIPCWrapper`` before we touch its attributes; the
@@ -159,3 +192,52 @@ class DeviceIPCWrapper:
             subclass identity preserved.
         """
         return pickle.loads(data)
+
+
+def _walk_ipc_wrappers(value: Any) -> Iterator[DeviceIPCWrapper]:
+    """Yield IPC wrappers nested in protocol container payloads."""
+    if isinstance(value, DeviceIPCWrapper):
+        yield value
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _walk_ipc_wrappers(item)
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            yield from _walk_ipc_wrappers(item)
+
+
+def release_ipc_exports(value: Any) -> None:
+    """Best-effort release of every unconsumed export nested in a payload.
+
+    Args:
+        value: A wrapper or protocol container containing wrappers.
+    """
+    for wrapper in _walk_ipc_wrappers(value):
+        try:
+            wrapper.release_ipc_export()
+        except Exception:
+            # Cleanup must neither strand later wrappers in the same batch nor
+            # replace the request/handler exception that led us here.
+            logger.exception(
+                "Failed to release IPC export for %s", type(wrapper).__name__
+            )
+
+
+def mark_ipc_exports_transferred(value: Any) -> None:
+    """Transfer nested IPC export ownership after an atomic transport send.
+
+    Args:
+        value: A wrapper or protocol container containing wrappers.
+    """
+    for wrapper in _walk_ipc_wrappers(value):
+        try:
+            wrapper.mark_ipc_export_transferred()
+        except Exception:
+            # The bytes have already been accepted atomically by the transport,
+            # so releasing here could race the receiver and double-decrement.
+            logger.exception(
+                "Failed to record IPC export transfer for %s",
+                type(wrapper).__name__,
+            )

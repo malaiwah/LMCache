@@ -49,6 +49,7 @@ from lmcache.v1.multiprocess.native_completion import (
 )
 from lmcache.v1.multiprocess.protocols.base import RequestType
 from lmcache.v1.platform.base_cache_context import BaseCacheContext
+from lmcache.v1.platform.base_ipc_wrapper import release_ipc_exports
 from lmcache.v1.platform.cache_context import create_cache_context
 import lmcache.c_ops as lmc_ops
 import lmcache.python_ops_fallback as _python_ops_fallback
@@ -865,45 +866,67 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             existing = self._cache_contexts.get(instance_id)
             if existing is not None:
                 existing.last_seen = now
-                logger.info(
-                    "Instance %d already registered; refreshing liveness",
-                    instance_id,
-                )
-                return
+        if existing is not None:
+            logger.info(
+                "Instance %d already registered; refreshing liveness",
+                instance_id,
+            )
+            # Recovery produced fresh one-shot CUDA exports, but the live
+            # context still owns the original imports. Return the unused
+            # reservations instead of leaking them at count=1.
+            release_ipc_exports(kv_caches)
+            return
 
         # Build the context and layout descriptor outside the lock.
-        cache_context = create_cache_context(
-            kv_caches,
-            self._ctx.chunk_size,
-            layout_hints=layout_hints or None,
-            engine_group_infos=engine_group_infos,
-            engine_type=engine_type,
-            separate_object_groups=self._ctx.separate_object_groups,
-            full_sw_kv=self._ctx.full_sw_kv,
-        )
-        layout_desc = get_layout_desc(
-            cache_context, self._ctx.chunk_size, object_group_id=0
-        )
-        kv_groups_manager = cache_context.kv_layer_groups_manager
-        attn_desc = kv_groups_manager.get_attn_desc()
-        self._ctx.layout_desc_registry.register(
-            model_name, world_size, layout_desc, attn_desc
-        )
-
-        with self._lock:
-            self._cache_contexts[instance_id] = ContextEntry(
-                cache_context=cache_context,
-                model_name=model_name,
-                world_size=world_size,
-                last_seen=now,
-                has_liveness_signal=False,
+        cache_context: BaseCacheContext | None = None
+        layout_registered = False
+        try:
+            cache_context = create_cache_context(
+                kv_caches,
+                self._ctx.chunk_size,
+                layout_hints=layout_hints or None,
+                engine_group_infos=engine_group_infos,
+                engine_type=engine_type,
+                separate_object_groups=self._ctx.separate_object_groups,
+                full_sw_kv=self._ctx.full_sw_kv,
             )
+            layout_desc = get_layout_desc(
+                cache_context, self._ctx.chunk_size, object_group_id=0
+            )
+            kv_groups_manager = cache_context.kv_layer_groups_manager
+            attn_desc = kv_groups_manager.get_attn_desc()
+            self._ctx.layout_desc_registry.register(
+                model_name, world_size, layout_desc, attn_desc
+            )
+            layout_registered = True
 
-        logger.info(
-            "Registered KV cache for GPU ID %d with %d layers",
-            instance_id,
-            cache_context.num_layers,
-        )
+            with self._lock:
+                self._cache_contexts[instance_id] = ContextEntry(
+                    cache_context=cache_context,
+                    model_name=model_name,
+                    world_size=world_size,
+                    last_seen=now,
+                    has_liveness_signal=False,
+                )
+
+            logger.info(
+                "Registered KV cache for GPU ID %d with %d layers",
+                instance_id,
+                cache_context.num_layers,
+            )
+        except BaseException:
+            if layout_registered:
+                self._ctx.layout_desc_registry.unregister(model_name, world_size)
+            if cache_context is not None:
+                try:
+                    cache_context.close()
+                except Exception:
+                    logger.exception("Failed to close rejected GPU cache context")
+            raise
+        finally:
+            # Imported wrappers are already terminal (their retained tensors own
+            # the decrement); any wrapper the backend did not consume is released.
+            release_ipc_exports(kv_caches)
 
     def unregister_kv_cache(self, instance_id: int) -> None:
         """Unregister the KV cache tensors for a given GPU instance ID.

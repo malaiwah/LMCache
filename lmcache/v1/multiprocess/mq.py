@@ -3,8 +3,8 @@
 from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
-    TimeoutError as FutureTimeoutError,
 )
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Callable, Generic, Optional, TypeVar, get_type_hints
 import enum
@@ -36,6 +36,10 @@ from lmcache.v1.multiprocess.protocol import (
     get_response_class,
 )
 from lmcache.v1.platform import EventNotifier, create_event_notifier
+from lmcache.v1.platform.base_ipc_wrapper import (
+    mark_ipc_exports_transferred,
+    release_ipc_exports,
+)
 
 logger = init_logger(__name__)
 
@@ -83,11 +87,26 @@ def unwrap_request_payloads(
     if len(b_payloads) != len(payload_clss):
         raise ValueError("Payload count does not match expected count")
 
-    decoded_payloads = [
-        msgspec_decode(payload, cls=cls)
-        for payload, cls in zip(b_payloads, payload_clss, strict=False)
-    ]
+    decoded_payloads: list[Any] = []
+    try:
+        for payload, cls in zip(b_payloads, payload_clss, strict=False):
+            decoded_payloads.append(msgspec_decode(payload, cls=cls))
+    except BaseException:
+        # A later payload can fail after a CUDA wrapper was already decoded.
+        # Deterministically return every still-unconsumed export reservation.
+        release_ipc_exports(decoded_payloads)
+        raise
     return decoded_payloads
+
+
+def _invoke_handler_with_ipc_cleanup(
+    handler: Callable[..., Any], decoded_payloads: list[Any]
+) -> Any:
+    """Run a handler and release any IPC wrappers it did not import."""
+    try:
+        return handler(*decoded_payloads)
+    finally:
+        release_ipc_exports(decoded_payloads)
 
 
 _SPECIAL_ENCODER_DECODERS = {
@@ -424,6 +443,7 @@ class MessageQueueClient:
                 # The caller's deadline elapsed before this request left the
                 # lifecycle-aware input queue. The remote never saw its
                 # transport resources, so they are safe to release now.
+                release_ipc_exports(wrapped_request.request_payloads)
                 wrapped_request.future.complete_transport()
                 continue
 
@@ -465,8 +485,12 @@ class MessageQueueClient:
                     [b_request_uid, b_request_type] + b_payloads,
                     flags=zmq.NOBLOCK,
                 )
+                # send_multipart is atomic: after it returns, the receiver owns
+                # every one-shot IPC export embedded in the request.
+                mark_ipc_exports_transferred(wrapped_request.request_payloads)
             except zmq.Again:
                 self.pending_futures.pop(request_uid, None)
+                release_ipc_exports(wrapped_request.request_payloads)
                 wrapped_request.future.set_exception(
                     RuntimeError("LMCache MQ send queue is full; server is unreachable")
                 )
@@ -477,6 +501,7 @@ class MessageQueueClient:
                 )
             except Exception as exc:
                 self.pending_futures.pop(request_uid, None)
+                release_ipc_exports(wrapped_request.request_payloads)
                 wrapped_request.future.set_exception(exc)
                 logger.exception("Cannot send LMCache MQ request_uid=%d", request_uid)
 
@@ -589,9 +614,11 @@ class MessageQueueClient:
         self.pending_futures.clear()
         while True:
             try:
-                futures.append(self.input_queue.get_nowait().future)
+                wrapped_request = self.input_queue.get_nowait()
             except queue.Empty:
                 break
+            release_ipc_exports(wrapped_request.request_payloads)
+            futures.append(wrapped_request.future)
         for future in futures:
             future.set_exception(ConnectionError(message))
 
@@ -656,7 +683,8 @@ class SyncRequestHandler(RequestHandlerBase[ResponseType]):
         self.handler = handler
 
     def __call__(self, payloads: list[bytes]) -> ResponseType:
-        return self.handler(*unwrap_request_payloads(payloads, self.payload_clss))
+        decoded_payloads = unwrap_request_payloads(payloads, self.payload_clss)
+        return _invoke_handler_with_ipc_cleanup(self.handler, decoded_payloads)
 
     def get_response_class(self) -> ResponseType:
         return self.response_cls
@@ -694,11 +722,21 @@ class BlockingRequestHandler(RequestHandlerBase[ResponseType]):
             "Call add_normal_thread_pool or add_affinity_thread_pool first."
         )
         decoded_payloads = unwrap_request_payloads(payloads, self.payload_clss)
-        if isinstance(self.executor, AffinityThreadPool):
+        try:
+            if isinstance(self.executor, AffinityThreadPool):
+                return self.executor.submit(
+                    _invoke_handler_with_ipc_cleanup,
+                    self.handler,
+                    decoded_payloads,
+                    affinity_key=affinity_key,
+                )
             return self.executor.submit(
-                self.handler, *decoded_payloads, affinity_key=affinity_key
+                _invoke_handler_with_ipc_cleanup, self.handler, decoded_payloads
             )
-        return self.executor.submit(self.handler, *decoded_payloads)
+        except BaseException:
+            # The worker never took ownership when task submission failed.
+            release_ipc_exports(decoded_payloads)
+            raise
 
     def get_response_class(self) -> ResponseType:
         return self.response_cls

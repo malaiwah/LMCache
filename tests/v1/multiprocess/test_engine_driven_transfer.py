@@ -292,6 +292,29 @@ def test_wrap_kv_caches_wraps_all_tensors() -> None:
     assert len(wrapped) == len(kv_caches)
 
 
+def test_wrap_kv_caches_releases_partial_cuda_exports_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later wrapper failure returns exports created by earlier iterations."""
+    # First Party
+    from lmcache.integration.vllm import vllm_multi_process_adapter as adapter_mod
+
+    first_wrapper = MagicMock(name="first_wrapper")
+    release = MagicMock()
+    wrap = MagicMock(
+        side_effect=[first_wrapper, RuntimeError("simulated CUDA wrap failure")]
+    )
+    monkeypatch.setattr(adapter_mod, "wrap_one_kv_cache", wrap)
+    monkeypatch.setattr(adapter_mod, "release_ipc_exports", release)
+
+    with pytest.raises(RuntimeError, match="simulated CUDA wrap failure"):
+        adapter_mod.wrap_kv_caches(
+            {"layer.0": torch.empty(0), "layer.1": torch.empty(0)}
+        )
+
+    release.assert_called_once_with([first_wrapper])
+
+
 def test_create_transfer_context_uses_non_cuda_context_on_cpu() -> None:
     """Ensure factory returns EngineDrivenTransferContext for CPU KV."""
     # First Party
