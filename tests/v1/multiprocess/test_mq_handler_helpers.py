@@ -6,7 +6,14 @@ These handlers are defined at module level to allow them to be pickled
 and passed between processes during multiprocessing tests.
 """
 
+# Standard
+import gc
+
+# Third Party
+import torch
+
 # First Party
+from lmcache import torch_dev
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
@@ -16,6 +23,13 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocol import KeyType
 from lmcache.v1.platform.base_ipc_wrapper import release_ipc_exports
+
+
+# The CUDA MQ lifecycle test deliberately retains imported tensors until the
+# same producer asks the server to unregister them.  This mirrors the
+# production cache-context ownership contract rather than treating REGISTER as
+# a one-shot serialization smoke test.
+_REGISTERED_CUDA_KV_CACHES: dict[int, list[torch.Tensor]] = {}
 
 # ==============================================================================
 # NOOP Request Handlers
@@ -92,6 +106,50 @@ def register_kv_cache_handler(
     # No return value (returns None implicitly)
 
 
+def register_and_retain_cuda_kv_cache_handler(
+    gpu_id: int,
+    kv_cache: KVCache,
+    model_name: str,
+    world_size: int,
+    engine_type: EngineType,
+    layout_hints: LayoutHints,
+    engine_group_infos: list[EngineGroupInfo],
+) -> None:
+    """Import and retain a CUDA KV cache until explicit unregister.
+
+    This handler is intentionally stateful.  The producer-side test client
+    remains alive after REGISTER succeeds, sends UNREGISTER over the same MQ
+    connection, and waits for that acknowledgement before it exits.
+    """
+    assert isinstance(gpu_id, int), f"Expected gpu_id to be int, got {type(gpu_id)}"
+    assert gpu_id not in _REGISTERED_CUDA_KV_CACHES, (
+        f"GPU ID {gpu_id} already has a retained KV cache"
+    )
+    assert isinstance(kv_cache, list), (
+        f"Expected kv_cache to be list, got {type(kv_cache)}"
+    )
+    assert kv_cache, "Expected a non-empty CUDA KV cache"
+    assert isinstance(model_name, str), (
+        f"Expected model_name to be str, got {type(model_name)}"
+    )
+    assert isinstance(world_size, int), (
+        f"Expected world_size to be int, got {type(world_size)}"
+    )
+    assert isinstance(engine_type, EngineType), (
+        f"Expected engine_type to be EngineType, got {type(engine_type)}"
+    )
+    assert isinstance(layout_hints, dict), (
+        f"Expected layout_hints to be dict, got {type(layout_hints)}"
+    )
+    assert isinstance(engine_group_infos, list), (
+        f"Expected engine_group_infos to be a list, got {type(engine_group_infos)}"
+    )
+
+    imported_tensors = [wrapper.to_tensor() for wrapper in kv_cache]
+    assert len(imported_tensors) == len(kv_cache)
+    _REGISTERED_CUDA_KV_CACHES[gpu_id] = imported_tensors
+
+
 # ==============================================================================
 # UNREGISTER_KV_CACHE Request Handlers
 # ==============================================================================
@@ -111,6 +169,32 @@ def unregister_kv_cache_handler(gpu_id: int) -> None:
     # For testing, we just validate the input is received correctly
     assert isinstance(gpu_id, int), f"Expected gpu_id to be int, got {type(gpu_id)}"
     # No return value (returns None implicitly)
+
+
+def unregister_and_release_cuda_kv_cache_handler(gpu_id: int) -> None:
+    """Drop retained imports and reclaim CUDA IPC state before replying."""
+    assert isinstance(gpu_id, int), f"Expected gpu_id to be int, got {type(gpu_id)}"
+    assert gpu_id in _REGISTERED_CUDA_KV_CACHES, (
+        f"GPU ID {gpu_id} has no retained KV cache to unregister"
+    )
+
+    imported_tensors = _REGISTERED_CUDA_KV_CACHES.pop(gpu_id)
+    assert imported_tensors, "Expected retained CUDA tensors before unregister"
+    imported_tensors.clear()
+    del imported_tensors
+    gc.collect()
+
+    # Match the production teardown contract closely: the UNREGISTER response
+    # is not sent until imported storage has been dropped and CUDA IPC cleanup
+    # has had an opportunity to return the producer refcounts.
+    if torch_dev.is_available():
+        torch_dev.synchronize()
+        torch_dev.empty_cache()
+        ipc_collect = getattr(torch_dev, "ipc_collect", None)
+        if ipc_collect is not None:
+            ipc_collect()
+
+    assert gpu_id not in _REGISTERED_CUDA_KV_CACHES
 
 
 # ==============================================================================

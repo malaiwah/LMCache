@@ -387,6 +387,40 @@ def test_register_fixture_releases_unconsumed_ipc_export() -> None:
     assert wrapper.transfer_calls == 0
 
 
+def test_register_fixture_retains_import_until_confirmed_unregister() -> None:
+    """The lifecycle fixture only drops an import during UNREGISTER."""
+    gpu_id = 8675309
+    wrapper = MagicMock(spec=DeviceIPCWrapper)
+    imported_tensor = torch.empty(1)
+    wrapper.to_tensor.return_value = imported_tensor
+
+    assert (
+        gpu_id not in test_mq_handler_helpers._REGISTERED_CUDA_KV_CACHES  # noqa: SLF001
+    )
+    test_mq_handler_helpers.register_and_retain_cuda_kv_cache_handler(
+        gpu_id,
+        [wrapper],
+        "model",
+        1,
+        EngineType.VLLM,
+        {},
+        [],
+    )
+    try:
+        retained = test_mq_handler_helpers._REGISTERED_CUDA_KV_CACHES[  # noqa: SLF001
+            gpu_id
+        ]
+        assert len(retained) == 1
+        assert retained[0] is imported_tensor
+        wrapper.to_tensor.assert_called_once_with()
+    finally:
+        test_mq_handler_helpers.unregister_and_release_cuda_kv_cache_handler(gpu_id)
+
+    assert (
+        gpu_id not in test_mq_handler_helpers._REGISTERED_CUDA_KV_CACHES  # noqa: SLF001
+    )
+
+
 def create_cache_key(index: int, model: str = "testmodel") -> IPCCacheServerKey:
     """
     Create a cache key for testing.
@@ -459,6 +493,9 @@ def _run_client_test(
     num_requests: int = 1,
     client_id: int = 0,
     payload_factory: Callable[[], list[Any]] | None = None,
+    teardown_request_type: RequestType | None = None,
+    teardown_payloads: list[Any] | None = None,
+    teardown_expected_response: Any = None,
 ) -> None:
     """
     Client process that sends requests and validates responses.
@@ -475,6 +512,11 @@ def _run_client_test(
             spawned client for each request. CUDA IPC wrappers must be created
             here so their first and only transport is the managed MQ encoder,
             rather than Python spawn pickling the test-helper arguments.
+        teardown_request_type: Optional request sent after every primary
+            response has been validated, while the same client/exporter is
+            still alive.
+        teardown_payloads: Payloads for the optional teardown request.
+        teardown_expected_response: Expected teardown response.
 
     Returns:
         bool: True if all tests passed, False otherwise
@@ -490,12 +532,18 @@ def _run_client_test(
     context = zmq.Context.instance()
     client = MessageQueueClient(server_url, context)
     successful = True
+    # Payload factories can create producer-owned CUDA allocations. Keep every
+    # resulting wrapper graph alive explicitly until the optional teardown RPC
+    # has been acknowledged; do not rely on a for-loop local surviving.
+    retained_factory_payloads: list[list[Any]] = []
 
     try:
         futures = []
         # Submit requests
         for _ in range(num_requests):
             request_payloads = payload_factory() if payload_factory else payloads
+            if payload_factory is not None:
+                retained_factory_payloads.append(request_payloads)
             future = client.submit_request(request_type, request_payloads)  # type: ignore
             futures.append(future)
 
@@ -511,6 +559,19 @@ def _run_client_test(
                 # Exit with error code
                 client.close()
                 sys.exit(1)
+
+        if teardown_request_type is not None:
+            if teardown_payloads is None:
+                raise ValueError("teardown_payloads are required for teardown")
+            teardown_future = client.submit_request(
+                teardown_request_type, teardown_payloads
+            )
+            teardown_response = teardown_future.result(timeout=5)
+            if teardown_response != teardown_expected_response:
+                raise AssertionError(
+                    f"Client {client_id}: expected teardown response "
+                    f"{teardown_expected_response}, got {teardown_response}"
+                )
 
     except Exception as e:
         print(f"Client {client_id} test failed with exception: {e}")
@@ -577,6 +638,9 @@ class MessageQueueTestHelper:
         num_clients: int = 1,
         timeout: float = 10.0,
         payload_factory: Callable[[], list[Any]] | None = None,
+        teardown_request_type: RequestType | None = None,
+        teardown_payloads: list[Any] | None = None,
+        teardown_expected_response: Any = None,
     ) -> None:
         """
         Run a test by starting server and client processes.
@@ -590,6 +654,10 @@ class MessageQueueTestHelper:
             timeout: Maximum time to wait for test completion
             payload_factory: Optional module-level per-request payload factory
                 executed inside each spawned client.
+            teardown_request_type: Optional request sent after all primary
+                responses while the same spawned client remains alive.
+            teardown_payloads: Payloads for the optional teardown request.
+            teardown_expected_response: Expected teardown response.
 
         Raises:
             AssertionError: If test fails
@@ -618,6 +686,9 @@ class MessageQueueTestHelper:
                     num_requests,
                     client_id,
                     payload_factory,
+                    teardown_request_type,
+                    teardown_payloads,
+                    teardown_expected_response,
                 ),
             )
             client_process.start()
@@ -737,13 +808,21 @@ def _make_register_kv_cache_payloads() -> list[Any]:
 )
 def test_mq_register_kv_cache():
     """
-    Test MessageQueue with REGISTER_KV_CACHE request type.
-    REGISTER_KV_CACHE takes (gpu_id: int, kv_cache: KVCache) and returns None.
+    Test the complete REGISTER/UNREGISTER CUDA IPC ownership lifecycle.
+
+    The receiver imports and retains the KV cache after REGISTER.  The same
+    live producer then sends UNREGISTER and waits for receiver-side release
+    before exiting, matching the graceful production shutdown contract.
     """
     # Create test helper and register handler
     helper = MessageQueueTestHelper(server_url="tcp://127.0.0.1:5559")
     helper.register_handler(
-        RequestType.REGISTER_KV_CACHE, test_mq_handler_helpers.register_kv_cache_handler
+        RequestType.REGISTER_KV_CACHE,
+        test_mq_handler_helpers.register_and_retain_cuda_kv_cache_handler,
+    )
+    helper.register_handler(
+        RequestType.UNREGISTER_KV_CACHE,
+        test_mq_handler_helpers.unregister_and_release_cuda_kv_cache_handler,
     )
 
     # Run test with REGISTER_KV_CACHE request
@@ -753,6 +832,9 @@ def test_mq_register_kv_cache():
         payload_factory=_make_register_kv_cache_payloads,
         expected_response=None,
         num_requests=1,
+        teardown_request_type=RequestType.UNREGISTER_KV_CACHE,
+        teardown_payloads=[0],
+        teardown_expected_response=None,
     )
 
 
