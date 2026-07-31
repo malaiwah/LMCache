@@ -61,11 +61,13 @@ class MessagingFuture(Generic[T]):
                 "Future result not available within timeout"
             )
             if self._expire(timeout_error):
-                raise timeout_error
+                # Keep the terminal sentinel traceback-free. Storing and
+                # raising the same exception would make the future retain its
+                # own result() frame and anything reachable from that frame.
+                raise LMCacheTimeoutError(str(timeout_error))
             # Completion won the deadline race while wait() was returning.
             # Fall through and consume that terminal state.
-        if self.exception_ is not None:
-            raise self.exception_
+        self._raise_if_failed()
         return self.result_
 
     def retain_until_complete(self, resource: Any) -> None:
@@ -128,6 +130,15 @@ class MessagingFuture(Generic[T]):
         if self._on_timeout is not None:
             self._on_timeout()
         return True
+
+    def _raise_if_failed(self) -> None:
+        """Raise the terminal failure without attaching state-owned timeouts."""
+        exception = self.exception_
+        if exception is None:
+            return
+        if isinstance(exception, LMCacheTimeoutError):
+            raise LMCacheTimeoutError(str(exception))
+        raise exception
 
 
 class CUDAMessagingFuture(MessagingFuture[T]):
@@ -238,7 +249,10 @@ class CUDAMessagingFuture(MessagingFuture[T]):
                 "CUDAMessagingFuture result not available within timeout"
             )
             if self.raw_future_._expire(timeout_error):
-                raise timeout_error
+                # The raw future owns the terminal sentinel. Raise a fresh
+                # instance so its traceback cannot retain this CUDA wrapper
+                # and the exporter event reachable from it.
+                raise LMCacheTimeoutError(str(timeout_error))
             # The raw response won the timeout race; consume it normally.
             return self.result()
 
