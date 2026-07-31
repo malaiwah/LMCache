@@ -8,6 +8,7 @@ and passed between processes during multiprocessing tests.
 
 # Standard
 import gc
+import weakref
 
 # Third Party
 import torch
@@ -22,7 +23,10 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocol import KeyType
-from lmcache.v1.platform.base_ipc_wrapper import release_ipc_exports
+from lmcache.v1.platform.base_ipc_wrapper import (
+    DeviceIPCWrapper,
+    release_ipc_exports,
+)
 
 
 # The CUDA MQ lifecycle test deliberately retains imported tensors until the
@@ -30,6 +34,13 @@ from lmcache.v1.platform.base_ipc_wrapper import release_ipc_exports
 # production cache-context ownership contract rather than treating REGISTER as
 # a one-shot serialization smoke test.
 _REGISTERED_CUDA_KV_CACHES: dict[int, list[torch.Tensor]] = {}
+_CUDA_KV_LIFETIME_PROBES: dict[
+    int,
+    tuple[
+        list[weakref.ReferenceType[DeviceIPCWrapper]],
+        list[weakref.ReferenceType[torch.Tensor]],
+    ],
+] = {}
 
 # ==============================================================================
 # NOOP Request Handlers
@@ -148,6 +159,10 @@ def register_and_retain_cuda_kv_cache_handler(
     imported_tensors = [wrapper.to_tensor() for wrapper in kv_cache]
     assert len(imported_tensors) == len(kv_cache)
     _REGISTERED_CUDA_KV_CACHES[gpu_id] = imported_tensors
+    _CUDA_KV_LIFETIME_PROBES[gpu_id] = (
+        [weakref.ref(wrapper) for wrapper in kv_cache],
+        [weakref.ref(tensor) for tensor in imported_tensors],
+    )
 
 
 # ==============================================================================
@@ -177,6 +192,17 @@ def unregister_and_release_cuda_kv_cache_handler(gpu_id: int) -> None:
     assert gpu_id in _REGISTERED_CUDA_KV_CACHES, (
         f"GPU ID {gpu_id} has no retained KV cache to unregister"
     )
+    assert gpu_id in _CUDA_KV_LIFETIME_PROBES, (
+        f"GPU ID {gpu_id} has no lifetime probes to unregister"
+    )
+
+    wrapper_refs, tensor_refs = _CUDA_KV_LIFETIME_PROBES.pop(gpu_id)
+    gc.collect()
+    live_wrappers = sum(ref() is not None for ref in wrapper_refs)
+    assert live_wrappers == 0, (
+        f"MQ dispatch retained {live_wrappers} decoded REGISTER wrapper(s) "
+        "after the REGISTER response"
+    )
 
     imported_tensors = _REGISTERED_CUDA_KV_CACHES.pop(gpu_id)
     assert imported_tensors, "Expected retained CUDA tensors before unregister"
@@ -194,7 +220,13 @@ def unregister_and_release_cuda_kv_cache_handler(gpu_id: int) -> None:
         if ipc_collect is not None:
             ipc_collect()
 
+    live_tensors = sum(ref() is not None for ref in tensor_refs)
+    assert live_tensors == 0, (
+        f"Receiver retained {live_tensors} imported REGISTER tensor(s) "
+        "after UNREGISTER cleanup"
+    )
     assert gpu_id not in _REGISTERED_CUDA_KV_CACHES
+    assert gpu_id not in _CUDA_KV_LIFETIME_PROBES
 
 
 # ==============================================================================

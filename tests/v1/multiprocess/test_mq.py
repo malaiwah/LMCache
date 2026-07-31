@@ -41,6 +41,7 @@ from lmcache.v1.multiprocess.server import add_handler_helper
 from lmcache.v1.platform.base_ipc_wrapper import (
     DeviceIPCWrapper,
     release_ipc_exports,
+    snapshot_ipc_exports,
 )
 from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
 
@@ -393,6 +394,8 @@ def test_register_fixture_retains_import_until_confirmed_unregister() -> None:
     wrapper = MagicMock(spec=DeviceIPCWrapper)
     imported_tensor = torch.empty(1)
     wrapper.to_tensor.return_value = imported_tensor
+    wrapper_ref = weakref.ref(wrapper)
+    tensor_ref = weakref.ref(imported_tensor)
 
     assert (
         gpu_id not in test_mq_handler_helpers._REGISTERED_CUDA_KV_CACHES  # noqa: SLF001
@@ -413,9 +416,16 @@ def test_register_fixture_retains_import_until_confirmed_unregister() -> None:
         assert len(retained) == 1
         assert retained[0] is imported_tensor
         wrapper.to_tensor.assert_called_once_with()
+        del retained
+        del wrapper
+        del imported_tensor
+        gc.collect()
+        assert wrapper_ref() is None
+        assert tensor_ref() is not None
     finally:
         test_mq_handler_helpers.unregister_and_release_cuda_kv_cache_handler(gpu_id)
 
+    assert tensor_ref() is None
     assert (
         gpu_id not in test_mq_handler_helpers._REGISTERED_CUDA_KV_CACHES  # noqa: SLF001
     )
@@ -484,6 +494,55 @@ def _server_process(
     server.close()
 
 
+def _producer_cuda_lifetime_refs(
+    payloads: list[Any],
+) -> tuple[
+    list[weakref.ReferenceType[DeviceIPCWrapper]],
+    list[weakref.ReferenceType[torch.Tensor]],
+]:
+    """Snapshot weak probes without retaining producer export objects."""
+    wrappers = snapshot_ipc_exports(payloads)
+    wrapper_refs = [weakref.ref(wrapper) for wrapper in wrappers]
+    tensor_refs = [
+        weakref.ref(producer_tensor)
+        for wrapper in wrappers
+        if (producer_tensor := getattr(wrapper, "_producer_tensor", None)) is not None
+    ]
+    return wrapper_refs, tensor_refs
+
+
+def _release_producer_exports_after_teardown(
+    retained_payloads: list[list[Any]],
+    wrapper_refs: list[weakref.ReferenceType[DeviceIPCWrapper]],
+    tensor_refs: list[weakref.ReferenceType[torch.Tensor]],
+) -> None:
+    """Destroy acknowledged exports before the producer process exits.
+
+    PyTorch keeps each producer refcounter-file offset in use until the
+    exporting tensor's ``CudaIPCSentData`` is destroyed. Leaving the payload
+    graph to interpreter teardown can therefore emit the producer-terminated
+    warning even after every receiver has decremented its counter.
+    """
+    retained_payloads.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    gc.collect()
+
+    live_wrappers = sum(ref() is not None for ref in wrapper_refs)
+    live_tensors = sum(ref() is not None for ref in tensor_refs)
+    assert live_wrappers == 0, (
+        f"Producer retained {live_wrappers} REGISTER wrapper(s) after "
+        "acknowledged UNREGISTER"
+    )
+    assert live_tensors == 0, (
+        f"Producer retained {live_tensors} exported CUDA tensor(s) after "
+        "acknowledged UNREGISTER"
+    )
+
+
 def _run_client_test(
     server_url: str,
     ready_event: EventClass,
@@ -536,6 +595,8 @@ def _run_client_test(
     # resulting wrapper graph alive explicitly until the optional teardown RPC
     # has been acknowledged; do not rely on a for-loop local surviving.
     retained_factory_payloads: list[list[Any]] = []
+    producer_wrapper_refs: list[weakref.ReferenceType[DeviceIPCWrapper]] = []
+    producer_tensor_refs: list[weakref.ReferenceType[torch.Tensor]] = []
 
     try:
         futures = []
@@ -544,6 +605,11 @@ def _run_client_test(
             request_payloads = payload_factory() if payload_factory else payloads
             if payload_factory is not None:
                 retained_factory_payloads.append(request_payloads)
+                wrapper_refs, tensor_refs = _producer_cuda_lifetime_refs(
+                    request_payloads
+                )
+                producer_wrapper_refs.extend(wrapper_refs)
+                producer_tensor_refs.extend(tensor_refs)
             future = client.submit_request(request_type, request_payloads)  # type: ignore
             futures.append(future)
 
@@ -572,6 +638,17 @@ def _run_client_test(
                     f"Client {client_id}: expected teardown response "
                     f"{teardown_expected_response}, got {teardown_response}"
                 )
+            # The receiver has proved it dropped every imported tensor before
+            # replying. Now and only now may the producer destroy its export
+            # wrappers/tensors and retire PyTorch's native refcounter offsets.
+            request_payloads = []
+            wrapper_refs = []
+            tensor_refs = []
+            _release_producer_exports_after_teardown(
+                retained_factory_payloads,
+                producer_wrapper_refs,
+                producer_tensor_refs,
+            )
 
     except Exception as e:
         print(f"Client {client_id} test failed with exception: {e}")
