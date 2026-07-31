@@ -253,6 +253,161 @@ def test_raw_future_retains_exporter_when_cuda_future_is_abandoned() -> None:
     assert event_ref() is None
 
 
+def test_timeout_releases_resources_once_and_rejects_late_reply() -> None:
+    """A deadline owns the terminal state and releases its transport lease once."""
+
+    class _Resource:
+        pass
+
+    timeout_notifications: list[str] = []
+    releases: list[str] = []
+    resource = _Resource()
+    resource_ref = weakref.ref(resource)
+    weakref.finalize(resource, releases.append, "released")
+    future = MessagingFuture[int](
+        on_timeout=lambda: timeout_notifications.append("timeout")
+    )
+    future.retain_until_complete(resource)
+    del resource
+
+    with pytest.raises(
+        TimeoutError, match="Future result not available within timeout"
+    ):
+        future.result(timeout=0)
+
+    gc.collect()
+    assert resource_ref() is None
+    assert releases == ["released"]
+    assert timeout_notifications == ["timeout"]
+
+    # A late response or transport failure cannot overwrite the timeout or
+    # release the already-detached resource a second time.
+    future.set_result(42)
+    future.set_exception(ConnectionError("late transport failure"))
+    gc.collect()
+    assert releases == ["released"]
+    assert timeout_notifications == ["timeout"]
+    with pytest.raises(
+        TimeoutError, match="Future result not available within timeout"
+    ):
+        future.result()
+
+
+def test_first_success_releases_resources_once_and_rejects_late_failure() -> None:
+    """A response wins once even when later terminal signals are delivered."""
+
+    class _Resource:
+        pass
+
+    releases: list[str] = []
+    resource = _Resource()
+    weakref.finalize(resource, releases.append, "released")
+    future = MessagingFuture[int]()
+    future.retain_until_complete(resource)
+    del resource
+
+    future.set_result(7)
+    future.set_exception(ConnectionError("late transport failure"))
+    future.set_result(9)
+
+    gc.collect()
+    assert releases == ["released"]
+    assert future.result() == 7
+
+
+def test_completion_timeout_race_has_one_terminal_owner() -> None:
+    """Concurrent completion and expiry never double-release or overwrite state."""
+
+    class _Resource:
+        pass
+
+    for _attempt in range(100):
+        timeout_notifications: list[str] = []
+        releases: list[str] = []
+        resource = _Resource()
+        weakref.finalize(resource, releases.append, "released")
+        future = MessagingFuture[int](
+            on_timeout=lambda: timeout_notifications.append("timeout")
+        )
+        future.retain_until_complete(resource)
+        del resource
+        start = threading.Barrier(3)
+        observed: list[int | BaseException] = []
+
+        def _expire() -> None:
+            start.wait()
+            try:
+                observed.append(future.result(timeout=0))
+            except BaseException as exc:
+                observed.append(exc)
+
+        def _complete() -> None:
+            start.wait()
+            future.set_result(11)
+
+        expiry_thread = threading.Thread(target=_expire)
+        completion_thread = threading.Thread(target=_complete)
+        expiry_thread.start()
+        completion_thread.start()
+        start.wait()
+        expiry_thread.join(timeout=2)
+        completion_thread.join(timeout=2)
+
+        assert not expiry_thread.is_alive()
+        assert not completion_thread.is_alive()
+        assert len(observed) == 1
+        if isinstance(observed[0], BaseException):
+            assert isinstance(observed[0], TimeoutError)
+            assert timeout_notifications == ["timeout"]
+            with pytest.raises(TimeoutError):
+                future.result()
+        else:
+            assert observed == [11]
+            assert timeout_notifications == []
+            assert future.result() == 11
+
+        future.set_result(99)
+        future.set_exception(ConnectionError("late"))
+        gc.collect()
+        assert releases == ["released"]
+
+
+def test_cuda_timeout_releases_raw_lease_but_not_caller_lease() -> None:
+    """The raw and CUDA wrappers release their event references independently."""
+
+    class _FakeEvent:
+        pass
+
+    event = _FakeEvent()
+    event_ref = weakref.ref(event)
+    raw_future = MessagingFuture[tuple[bytes, bool]]()
+    cuda_future = raw_future.to_cuda_future(
+        device="cuda:0",
+        completion_event=event,
+    )
+    del event
+
+    with pytest.raises(
+        TimeoutError, match="CUDAMessagingFuture result not available within timeout"
+    ):
+        cuda_future.result(timeout=0)
+
+    # Expiry detached the raw future's lease, but the caller-visible CUDA
+    # future still owns the exporter until the caller abandons it.
+    gc.collect()
+    assert event_ref() is not None
+    del cuda_future
+    gc.collect()
+    assert event_ref() is None
+
+    # The late transport response is ignored and cannot replace the timeout.
+    raw_future.set_result((b"late-worker-owned-event", True))
+    with pytest.raises(
+        TimeoutError, match="CUDAMessagingFuture result not available within timeout"
+    ):
+        raw_future.result()
+
+
 # ==============================================================================
 # CUDAMessagingFuture Tests
 # ==============================================================================
