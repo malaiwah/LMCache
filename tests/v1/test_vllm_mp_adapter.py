@@ -26,6 +26,7 @@ from lmcache.integration.vllm.vllm_multi_process_adapter import (
     ParallelStrategy,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.mq import RemoteHandlerError
 from lmcache.v1.multiprocess.protocol import RequestType
 
 
@@ -705,6 +706,42 @@ def test_straggler_cycle_after_stop_skips_callback_and_event(monkeypatch) -> Non
     assert not health_event.is_set()
 
 
+def test_stop_during_blocked_recovery_callback_prevents_health_resurrection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stop() wins even after a successful callback has already started."""
+    monkeypatch.setattr(
+        adapter_mod, "send_ping", lambda mq_client, timeout, instance_id=None: True
+    )
+    health_event = threading.Event()
+    heartbeat = HeartbeatThread(
+        mq_client=MagicMock(name="mq_client"),
+        health_event=health_event,
+        interval=60.0,
+    )
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+
+    def blocked_recover() -> bool:
+        callback_entered.set()
+        assert release_callback.wait(timeout=10.0)
+        return True
+
+    heartbeat.register_recover_callback(blocked_recover)
+    heartbeat.start()
+    assert callback_entered.wait(timeout=10.0)
+    heartbeat.stop(timeout=0.05)
+    assert heartbeat.stop_requested
+    release_callback.set()
+
+    deadline = time.time() + 10.0
+    while heartbeat.total_runs == 0 and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert heartbeat.total_runs == 1
+    assert not health_event.is_set()
+
+
 def test_recover_callback_skips_register_after_stop_requested(
     fake_adapter, monkeypatch
 ) -> None:
@@ -826,12 +863,10 @@ def test_startup_does_not_warn_for_default_heartbeat_interval(
     assert not any("reap" in msg for msg in warnings)
 
 
-def test_recover_callback_rebuilds_transfer_ctx_without_closing_previous(
+def test_recover_callback_replaces_and_closes_previous_transfer_ctx(
     fake_adapter, monkeypatch
 ) -> None:
-    """Pin current behavior: every recover-callback invocation rebuilds
-    ``transfer_ctx`` without closing the previous context (known IPC leak;
-    in-flight submissions may still hold a reference to the old context)."""
+    """Each successful recovery retires exactly the context it superseded."""
     adapter, _send_mock, _ = fake_adapter
     contexts = _patch_transfer_context_factory(monkeypatch)
 
@@ -845,18 +880,167 @@ def test_recover_callback_rebuilds_transfer_ctx_without_closing_previous(
     assert len(contexts) == 1
     assert adapter.transfer_ctx is contexts[0]
 
-    # Each recover-callback invocation rebuilds transfer_ctx without closing
-    # the previous context (known IPC leak; in-flight submissions may still
-    # hold a reference to the old context).
     assert heartbeat.recover_callback() is True
     assert len(contexts) == 2
     assert adapter.transfer_ctx is contexts[1]
-    contexts[0].close.assert_not_called()
+    contexts[0].close.assert_called_once_with()
+    contexts[1].close.assert_not_called()
 
     assert heartbeat.recover_callback() is True
     assert len(contexts) == 3
     assert adapter.transfer_ctx is contexts[2]
-    contexts[1].close.assert_not_called()
+    contexts[0].close.assert_called_once_with()
+    contexts[1].close.assert_called_once_with()
+    contexts[2].close.assert_not_called()
+
+
+def test_failed_recovery_closes_candidate_and_preserves_previous_context(
+    fake_adapter, monkeypatch
+) -> None:
+    """A failed REGISTER never publishes its half-initialized context."""
+    adapter, _send_mock, _ = fake_adapter
+    contexts = _patch_transfer_context_factory(monkeypatch)
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+    adapter.submit_store_request("req-1", _op([[0]]), MagicMock())
+    heartbeat = FakeHeartbeatThread.instances[0]
+    assert heartbeat.recover_callback is not None
+
+    # The next factory result is configured after creation, so inject the
+    # failure through a factory wrapper.
+    original_factory = adapter_mod.create_transfer_context
+
+    def failing_factory(kv_caches, mode):
+        context = original_factory(kv_caches, mode)
+        context.register.side_effect = RuntimeError("register failed")
+        return context
+
+    monkeypatch.setattr(adapter_mod, "create_transfer_context", failing_factory)
+
+    assert heartbeat.recover_callback() is False
+    assert len(contexts) == 2
+    assert adapter.transfer_ctx is contexts[0]
+    contexts[0].close.assert_not_called()
+    contexts[1].close.assert_called_once_with()
+
+
+def test_shutdown_orders_unregister_after_blocked_recovery_register(
+    fake_adapter, monkeypatch
+) -> None:
+    """A recovery already in flight completes before shutdown UNREGISTER."""
+    adapter, send_mock, future = fake_adapter
+    contexts = _patch_transfer_context_factory(monkeypatch)
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+    adapter.submit_store_request("req-1", _op([[0]]), MagicMock())
+    heartbeat = FakeHeartbeatThread.instances[0]
+    assert heartbeat.recover_callback is not None
+
+    register_entered = threading.Event()
+    release_register = threading.Event()
+    stop_observed = threading.Event()
+    order: list[str] = []
+    original_factory = adapter_mod.create_transfer_context
+
+    def blocking_factory(kv_caches, mode):
+        context = original_factory(kv_caches, mode)
+
+        def blocked_register(*args, **kwargs) -> None:
+            del args, kwargs
+            order.append("register-start")
+            register_entered.set()
+            assert release_register.wait(timeout=10.0)
+            order.append("register-end")
+
+        context.register.side_effect = blocked_register
+        return context
+
+    monkeypatch.setattr(adapter_mod, "create_transfer_context", blocking_factory)
+    original_stop = heartbeat.stop
+
+    def recording_stop(timeout: float = 5.0) -> None:
+        original_stop(timeout)
+        stop_observed.set()
+
+    heartbeat.stop = recording_stop
+
+    def record_send(mq_client, request_type, payloads):
+        del mq_client, payloads
+        if request_type in (
+            RequestType.UNREGISTER_KV_CACHE,
+            RequestType.UNREGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT,
+        ):
+            order.append("unregister")
+        return future
+
+    send_mock.side_effect = record_send
+    recovery_result: list[bool] = []
+    recovery = threading.Thread(
+        target=lambda: recovery_result.append(heartbeat.recover_callback())
+    )
+    recovery.start()
+    assert register_entered.wait(timeout=10.0)
+
+    shutdown_errors: list[BaseException] = []
+
+    def run_shutdown() -> None:
+        try:
+            adapter.shutdown()
+        except BaseException as exc:
+            shutdown_errors.append(exc)
+
+    shutdown = threading.Thread(target=run_shutdown)
+    shutdown.start()
+    assert stop_observed.wait(timeout=10.0)
+    assert "unregister" not in order
+
+    release_register.set()
+    recovery.join(timeout=10.0)
+    shutdown.join(timeout=10.0)
+
+    assert not recovery.is_alive()
+    assert not shutdown.is_alive()
+    assert shutdown_errors == []
+    assert recovery_result == [False]
+    assert order == ["register-start", "register-end", "unregister"]
+    assert adapter.transfer_ctx is None
+    contexts[0].close.assert_called_once_with()
+    contexts[1].close.assert_called_once_with()
+    assert not adapter.is_healthy
+
+
+@pytest.mark.parametrize(
+    "unregister_error",
+    [
+        RuntimeError("local unregister failure"),
+        RemoteHandlerError(
+            RequestType.UNREGISTER_KV_CACHE,
+            "RuntimeError",
+            "remote unregister failure",
+        ),
+    ],
+)
+def test_shutdown_closes_all_local_resources_when_unregister_raises(
+    fake_adapter, unregister_error: Exception
+) -> None:
+    """Remote/local UNREGISTER errors propagate only after complete cleanup."""
+    adapter, _send_mock, future = fake_adapter
+    transfer_ctx = MagicMock(name="transfer_ctx")
+    telemetry = MagicMock(name="request_telemetry")
+    adapter.transfer_ctx = transfer_ctx
+    adapter.request_telemetry = telemetry
+    future.result.side_effect = unregister_error
+
+    with pytest.raises(type(unregister_error)) as exc_info:
+        adapter.shutdown()
+
+    assert exc_info.value is unregister_error
+    transfer_ctx.close.assert_called_once_with()
+    adapter.mq_client.close.assert_called_once_with()
+    telemetry.close.assert_called_once_with()
+    assert adapter.transfer_ctx is None
 
 
 def _finished_retrieve_future(result: object) -> MagicMock:

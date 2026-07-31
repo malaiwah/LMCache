@@ -4,11 +4,13 @@ from multiprocessing.synchronize import Event as EventClass
 from types import SimpleNamespace
 from typing import Any, Callable
 from unittest.mock import MagicMock
+import gc
 import multiprocessing as mp
 import sys
 import queue
 import threading
 import time
+import weakref
 
 # Third Party
 import pytest
@@ -728,8 +730,8 @@ def test_full_dead_client_queue_does_not_block_healthy_client(
         server.close()
 
 
-def test_timed_out_future_is_reclaimed_and_late_response_is_ignored() -> None:
-    """A caller deadline retires its UID; a late reply stays quarantined."""
+def test_sent_timeout_stays_pending_until_late_response_is_transport_safe() -> None:
+    """Caller expiry preserves the sent UID until its late reply is consumed."""
     client = MessageQueueClient.__new__(MessageQueueClient)
     client.input_queue = queue.Queue()
     client._request_counter = iter([17])
@@ -745,9 +747,10 @@ def test_timed_out_future_is_reclaimed_and_late_response_is_ignored() -> None:
         future.result(timeout=0)
     client._polling_loop.notify.assert_called()
 
-    # Reclamation happens on the polling thread, not in result()'s caller.
+    # A sent request cannot be reclaimed merely because its caller expired:
+    # the remote may still be using request-owned IPC resources.
     client.process_outbound_task()
-    assert client.pending_futures == {}
+    assert client.pending_futures == {17: future}
 
     client.socket.recv_multipart.return_value = [
         mq_mod.msgspec_encode(17, cls=mq_mod.RequestUID),
@@ -755,8 +758,94 @@ def test_timed_out_future_is_reclaimed_and_late_response_is_ignored() -> None:
         mq_mod.msgspec_encode("NOOP_OK", cls=str),
     ]
     client.process_inbound()
+    assert client.pending_futures == {}
+    assert future.transport_complete
     with pytest.raises(TimeoutError, match="not available within timeout"):
         future.result()
+
+
+def test_timeout_before_send_releases_transport_resources_without_sending() -> None:
+    """An expired queued request is safe to cancel before the socket sees it."""
+
+    class _Resource:
+        pass
+
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.input_queue = queue.Queue()
+    client._request_counter = iter([21])
+    client.pending_futures = {}
+    client._polling_loop = MagicMock()
+    client.socket = MagicMock()
+
+    future = client.submit_request(RequestType.NOOP, [])
+    resource = _Resource()
+    resource_ref = weakref.ref(resource)
+    future.retain_until_transport_complete(resource)
+    del resource
+
+    with pytest.raises(TimeoutError):
+        future.result(timeout=0)
+    gc.collect()
+    assert resource_ref() is not None
+
+    client.process_outbound_task()
+    gc.collect()
+
+    assert future.transport_complete
+    assert resource_ref() is None
+    assert client.pending_futures == {}
+    client.socket.send_multipart.assert_not_called()
+
+
+@pytest.mark.parametrize("teardown", ["reset", "close"])
+def test_transport_teardown_releases_timed_out_inflight_cuda_exporter(
+    teardown: str,
+) -> None:
+    """Reset/close is a safe terminal point for an unanswered CUDA request."""
+
+    class _FakeEvent:
+        pass
+
+    loop = ClientPollingLoop.__new__(ClientPollingLoop)
+    loop._poller = MagicMock()
+    old_socket = MagicMock(name="old_socket")
+    new_socket = MagicMock(name="new_socket")
+    client = MessageQueueClient.__new__(MessageQueueClient)
+    client.ctx = MagicMock()
+    client.ctx.socket.return_value = new_socket
+    client.server_url = "tcp://127.0.0.1:16024"
+    client.socket = old_socket
+    client._socket_closed = False
+    client._socket_close_lock = threading.Lock()
+    client.pending_futures = {}
+    client.input_queue = queue.Queue()
+    loop._socket_to_client = {old_socket: client}
+
+    raw_future = mq_mod.MessagingFuture[tuple[bytes, bool]]()
+    event = _FakeEvent()
+    event_ref = weakref.ref(event)
+    cuda_future = raw_future.to_cuda_future(
+        device="cuda:0",
+        completion_event=event,
+    )
+    client.pending_futures[9] = raw_future
+    del event
+    with pytest.raises(TimeoutError):
+        cuda_future.result(timeout=0)
+    del cuda_future
+    gc.collect()
+    assert event_ref() is not None
+
+    if teardown == "reset":
+        loop._reset_client(client)
+    else:
+        loop._retire_client(client)
+    gc.collect()
+
+    assert raw_future.transport_complete
+    assert event_ref() is None
+    with pytest.raises(TimeoutError):
+        raw_future.result()
 
 
 def test_connection_reset_discards_stale_pending_and_unsent_work() -> None:

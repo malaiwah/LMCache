@@ -5,9 +5,11 @@ import threading
 
 # First Party
 from lmcache import torch_dev, torch_device_type
+from lmcache.logging import init_logger
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 
 T = TypeVar("T")
+logger = init_logger(__name__)
 
 
 class MessagingFuture(Generic[T]):
@@ -17,6 +19,11 @@ class MessagingFuture(Generic[T]):
         self.exception_: BaseException | None = None
         self._completion_lock = threading.Lock()
         self._retained_resources: list[Any] = []
+        # Caller completion and transport completion are distinct.  A request
+        # can time out for its caller after it was sent while the remote side
+        # still owns CUDA IPC handles embedded in that request.
+        self._transport_complete = False
+        self._transport_resources: list[Any] = []
         self._on_timeout = on_timeout
 
     def query(self) -> bool:
@@ -64,7 +71,7 @@ class MessagingFuture(Generic[T]):
                 # Keep the terminal sentinel traceback-free. Storing and
                 # raising the same exception would make the future retain its
                 # own result() frame and anything reachable from that frame.
-                raise LMCacheTimeoutError(str(timeout_error))
+                raise LMCacheTimeoutError.from_recorded_timeout(str(timeout_error))
             # Completion won the deadline race while wait() was returning.
             # Fall through and consume that terminal state.
         self._raise_if_failed()
@@ -76,6 +83,37 @@ class MessagingFuture(Generic[T]):
             if not self.is_done_.is_set():
                 self._retained_resources.append(resource)
 
+    def retain_until_transport_complete(self, resource: Any) -> None:
+        """Keep ``resource`` alive until the transport is finished with it.
+
+        Unlike :meth:`retain_until_complete`, a caller deadline does not
+        release this lease.  The message queue releases it only after a reply,
+        a send failure, a pre-send cancellation, or transport teardown.
+        """
+        with self._completion_lock:
+            if not self._transport_complete:
+                self._transport_resources.append(resource)
+
+    @property
+    def transport_complete(self) -> bool:
+        """Whether the message transport can no longer access request data."""
+        with self._completion_lock:
+            return self._transport_complete
+
+    def complete_transport(self) -> bool:
+        """Mark transport ownership complete and release its resources once."""
+        with self._completion_lock:
+            if self._transport_complete:
+                return False
+            self._transport_complete = True
+            transport_resources = self._transport_resources
+            self._transport_resources = []
+
+        # CUDA/event destructors may synchronize.  Never run them while
+        # holding the state lock.
+        transport_resources.clear()
+        return True
+
     def set_result(self, result: T) -> None:
         """
         Set the result of the future and mark it as done. This function is NOT
@@ -86,12 +124,14 @@ class MessagingFuture(Generic[T]):
             result (T): The result to set.
         """
         self._complete(result=result)
+        self.complete_transport()
 
     def set_exception(self, exception: BaseException) -> None:
         """Complete the future with an exception from the messaging system."""
         if not isinstance(exception, BaseException):
             raise TypeError("exception must derive from BaseException")
         self._complete(exception=exception)
+        self.complete_transport()
 
     def to_cuda_future(
         self,
@@ -128,7 +168,13 @@ class MessagingFuture(Generic[T]):
         if not self._complete(exception=exception):
             return False
         if self._on_timeout is not None:
-            self._on_timeout()
+            try:
+                self._on_timeout()
+            except Exception:
+                # Timeout notification is advisory (normally it wakes the MQ
+                # poller).  It must never replace the committed timeout with a
+                # callback implementation failure.
+                logger.exception("MessagingFuture timeout callback failed")
         return True
 
     def _raise_if_failed(self) -> None:
@@ -137,7 +183,7 @@ class MessagingFuture(Generic[T]):
         if exception is None:
             return
         if isinstance(exception, LMCacheTimeoutError):
-            raise LMCacheTimeoutError(str(exception))
+            raise LMCacheTimeoutError.from_recorded_timeout(str(exception))
         raise exception
 
 
@@ -162,36 +208,46 @@ class CUDAMessagingFuture(MessagingFuture[T]):
         self.exported_event_: Any | None = completion_event
         self.result_: T | None = None
         self.device_ = device if device is not None else torch_dev.current_device()
+        self._materialization_lock = threading.Lock()
         if completion_event is not None:
             # The caller-visible CUDA future may be abandoned after a timeout.
             # Keep an independent reference on the raw transport future until
             # its first terminal state so caller abandonment cannot release an
             # exporter while the request is still pending.
-            raw_future.retain_until_complete(completion_event)
+            raw_future.retain_until_transport_complete(completion_event)
 
     def _on_raw_future_complete(self):
         """
         Update the CUDA event and result when the raw future is complete.
         """
-        event_bytes, result = self.raw_future_.result()
-        self.result_ = result
-
-        if self.exported_event_ is not None:
-            self.event_ = self.exported_event_
-            self.exported_event_ = None
+        if self.event_ is not None:
             return
+        with self._materialization_lock:
+            # query()/wait()/result() may be called from different engine
+            # threads.  Import or transfer ownership of an IPC handle exactly
+            # once.
+            if self.event_ is not None:
+                return
 
-        # Legacy callers do not retain an exporter-owned event, so import the
-        # completion handle created by the server.
-        if not hasattr(torch_dev, "Event") or not hasattr(
-            torch_dev.Event, "from_ipc_handle"
-        ):
-            raise RuntimeError(
-                f"Backend '{torch_device_type}' does not support interprocess "
-                "Events (Event.from_ipc_handle not available). "
-                "Multiprocess IPC requires CUDA."
-            )
-        self.event_ = torch_dev.Event.from_ipc_handle(self.device_, event_bytes)
+            event_bytes, result = self.raw_future_.result()
+            self.result_ = result
+
+            if self.exported_event_ is not None:
+                self.event_ = self.exported_event_
+                self.exported_event_ = None
+                return
+
+            # Legacy callers do not retain an exporter-owned event, so import
+            # the completion handle created by the server.
+            if not hasattr(torch_dev, "Event") or not hasattr(
+                torch_dev.Event, "from_ipc_handle"
+            ):
+                raise RuntimeError(
+                    f"Backend '{torch_device_type}' does not support interprocess "
+                    "Events (Event.from_ipc_handle not available). "
+                    "Multiprocess IPC requires CUDA."
+                )
+            self.event_ = torch_dev.Event.from_ipc_handle(self.device_, event_bytes)
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         """
@@ -252,7 +308,7 @@ class CUDAMessagingFuture(MessagingFuture[T]):
                 # The raw future owns the terminal sentinel. Raise a fresh
                 # instance so its traceback cannot retain this CUDA wrapper
                 # and the exporter event reachable from it.
-                raise LMCacheTimeoutError(str(timeout_error))
+                raise LMCacheTimeoutError.from_recorded_timeout(str(timeout_error))
             # The raw response won the timeout race; consume it normally.
             return self.result()
 

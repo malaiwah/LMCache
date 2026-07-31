@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from unittest.mock import MagicMock
 import gc
 import multiprocessing as mp
 import threading
@@ -11,6 +12,8 @@ import pytest
 import torch
 
 # First Party
+from lmcache.v1.mp_observability import errors as timeout_errors_mod
+from lmcache.v1.multiprocess import futures as futures_mod
 from lmcache.v1.multiprocess.futures import CUDAMessagingFuture, MessagingFuture
 
 # ==============================================================================
@@ -375,8 +378,8 @@ def test_completion_timeout_race_has_one_terminal_owner() -> None:
         _run_race()
 
 
-def test_cuda_timeout_releases_raw_lease_but_not_caller_lease() -> None:
-    """The raw and CUDA wrappers release their event references independently."""
+def test_cuda_timeout_quarantines_exporter_until_late_transport_reply() -> None:
+    """A sent request timeout cannot release an exporter still used remotely."""
 
     class _FakeEvent:
         pass
@@ -396,19 +399,119 @@ def test_cuda_timeout_releases_raw_lease_but_not_caller_lease() -> None:
         cuda_future.result(timeout=0)
 
     # Expiry detached the raw future's lease, but the caller-visible CUDA
-    # future still owns the exporter until the caller abandons it.
+    # future and the transport lease both still own the exporter.
     gc.collect()
     assert event_ref() is not None
     del cuda_future
     gc.collect()
-    assert event_ref() is None
+    assert event_ref() is not None
 
-    # The late transport response is ignored and cannot replace the timeout.
+    # The late transport response cannot replace the caller timeout, but it
+    # does establish the safe point at which the exporter can be released.
     raw_future.set_result((b"late-worker-owned-event", True))
+    gc.collect()
+    assert event_ref() is None
     with pytest.raises(
         TimeoutError, match="CUDAMessagingFuture result not available within timeout"
     ):
         raw_future.result()
+
+
+def test_timeout_callback_failure_does_not_replace_terminal_timeout() -> None:
+    """A notifier failure is contained and the first deadline remains stable."""
+    callback_calls = 0
+
+    def failing_callback() -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+        raise RuntimeError("notifier failed")
+
+    future = MessagingFuture[int](on_timeout=failing_callback)
+
+    for timeout in (0, None, None):
+        with pytest.raises(
+            TimeoutError, match="Future result not available within timeout"
+        ):
+            future.result(timeout=timeout)
+
+    assert callback_calls == 1
+
+
+def test_repeated_timeout_consumption_publishes_one_observability_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh raised instances do not report the same deadline repeatedly."""
+    published: list[str] = []
+    monkeypatch.setattr(timeout_errors_mod, "is_observability_enabled", lambda: True)
+    monkeypatch.setattr(
+        timeout_errors_mod.LMCacheTimeoutError,
+        "_publish_timeout_event",
+        lambda self, message, stacktrace, session_id: published.append(message),
+    )
+    future = MessagingFuture[int]()
+
+    for timeout in (0, None, None):
+        with pytest.raises(TimeoutError):
+            future.result(timeout=timeout)
+
+    assert published == ["Future result not available within timeout"]
+
+
+def test_cuda_future_materializes_ipc_event_once_for_concurrent_consumers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent query calls cannot import the same IPC event twice."""
+
+    class _FakeEvent:
+        def query(self) -> bool:
+            return True
+
+        def synchronize(self) -> None:
+            pass
+
+    factory_calls = 0
+    factory_lock = threading.Lock()
+    second_factory_call = threading.Event()
+
+    def from_ipc_handle(device: object, event_bytes: bytes) -> _FakeEvent:
+        del device, event_bytes
+        nonlocal factory_calls
+        with factory_lock:
+            factory_calls += 1
+            call_number = factory_calls
+        if call_number == 1:
+            # Without the materialization lock, the second consumer enters the
+            # factory and releases this wait. With the fix, this bounded wait
+            # expires and the second consumer observes the materialized event.
+            second_factory_call.wait(timeout=0.2)
+        else:
+            second_factory_call.set()
+        return _FakeEvent()
+
+    fake_backend = MagicMock()
+    fake_backend.Event.from_ipc_handle.side_effect = from_ipc_handle
+    monkeypatch.setattr(futures_mod, "torch_dev", fake_backend)
+
+    raw_future = MessagingFuture[tuple[bytes, int]]()
+    raw_future.set_result((b"ipc-event", 7))
+    cuda_future = raw_future.to_cuda_future(device="cuda:0")
+    start = threading.Barrier(3)
+    results: list[bool] = []
+
+    def consume() -> None:
+        start.wait()
+        results.append(cuda_future.query())
+
+    consumers = [threading.Thread(target=consume) for _ in range(2)]
+    for consumer in consumers:
+        consumer.start()
+    start.wait()
+    for consumer in consumers:
+        consumer.join(timeout=2)
+
+    assert all(not consumer.is_alive() for consumer in consumers)
+    assert results == [True, True]
+    assert factory_calls == 1
 
 
 # ==============================================================================

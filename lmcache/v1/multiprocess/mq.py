@@ -408,10 +408,11 @@ class MessageQueueClient:
             raise
 
     def process_outbound_task(self) -> None:
-        # A timed-out future is terminal. Reclaim it only here, on the polling
-        # thread, so a late response cannot race a caller-side dict mutation.
+        # Reclaim only transport-complete futures here. A caller timeout after
+        # send is terminal to the caller but the remote side may still open,
+        # wait on, or re-record CUDA IPC handles embedded in the request.
         for request_uid, future in list(self.pending_futures.items()):
-            if future.query():
+            if future.transport_complete:
                 self.pending_futures.pop(request_uid, None)
 
         while True:
@@ -421,7 +422,9 @@ class MessageQueueClient:
                 return
             if wrapped_request.future.query():
                 # The caller's deadline elapsed before this request left the
-                # lifecycle-aware input queue.
+                # lifecycle-aware input queue. The remote never saw its
+                # transport resources, so they are safe to release now.
+                wrapped_request.future.complete_transport()
                 continue
 
             request_uid = wrapped_request.request_uid

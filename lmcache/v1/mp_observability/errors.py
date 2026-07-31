@@ -46,6 +46,19 @@ class LMCacheTimeoutError(TimeoutError):
         stacktrace = "".join(traceback.format_stack()[:-1])
         self._publish_timeout_event(message, stacktrace, session_id)
 
+    @classmethod
+    def from_recorded_timeout(cls, message: str) -> "LMCacheTimeoutError":
+        """Build an exception for a timeout whose event was already recorded.
+
+        A terminal future may be consumed more than once.  Each consumption
+        still needs a fresh exception object so traceback frames are not
+        retained by the future, but it must not publish another
+        ``TIMEOUT_RAISED`` event for the same deadline.
+        """
+        instance = cls.__new__(cls)
+        TimeoutError.__init__(instance, message)
+        return instance
+
     def _publish_timeout_event(
         self, message: str, stacktrace: str, session_id: str
     ) -> None:
