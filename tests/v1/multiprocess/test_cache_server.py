@@ -3,6 +3,7 @@
 from typing import Generator
 import multiprocessing as mp
 import os
+import signal
 import time
 
 # Third Party
@@ -46,10 +47,18 @@ def _has_working_new_shared_cuda() -> bool:
         print("CUDA is not available, skipping tests that require new_shared_cuda")
         return False
     try:
-        # Minimal sanity check — adapt to your real API
+        # ``_share_cuda_`` increments a producer-side IPC refcounter.  This
+        # capability probe has no consumer, so return that reservation before
+        # dropping the test tensor; otherwise PyTorch correctly warns at
+        # process exit that a shared CUDA tensor is still outstanding.
         buf = torch.empty(1024, device="cuda")
-        shared = buf.untyped_storage()._share_cuda_()  # or your exact call
-        return shared is not None
+        shared = buf.untyped_storage()._share_cuda_()
+        if shared is None:
+            return False
+        torch.UntypedStorage._release_ipc_counter_cuda(  # noqa: SLF001
+            shared[4], shared[5]
+        )
+        return True
     except Exception:
         return False
 
@@ -266,6 +275,11 @@ def server_process_runner(
     """
     Entry point for the server process.
     """
+    # Match the production CLI's SIGTERM behavior.  ``Process.terminate()``
+    # then raises KeyboardInterrupt inside ``run_cache_server``, allowing it
+    # to close its worker pools, imported CUDA IPC contexts, and storage
+    # manager before the child exits.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     mp_config = MPServerConfig(host=host, port=port, chunk_size=chunk_size)
     storage_manager_config = StorageManagerConfig(
         l1_manager_config=L1ManagerConfig(

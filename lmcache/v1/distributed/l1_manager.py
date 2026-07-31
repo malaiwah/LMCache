@@ -802,12 +802,23 @@ class L1Manager:
                 write-locked and read-locked objects intact.
         """
         if force:
-            logger.warning(
-                "L1Manager: force-clearing all %d objects "
-                "(including locked ones). This may corrupt in-flight "
-                "store/prefetch operations — use with caution.",
-                len(self._objects),
+            locked_count = sum(
+                entry.write_lock.is_locked() or entry.read_lock.is_locked()
+                for entry in self._objects.values()
             )
+            if locked_count:
+                logger.warning(
+                    "L1Manager: force-clearing all %d objects, including %d "
+                    "locked object(s). This may corrupt in-flight "
+                    "store/prefetch operations — use with caution.",
+                    len(self._objects),
+                    locked_count,
+                )
+            else:
+                logger.info(
+                    "L1Manager: force-clearing all %d unlocked object(s).",
+                    len(self._objects),
+                )
             all_keys = list(self._objects.keys())
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
             self._memory_manager.free(all_memory_objs)

@@ -42,6 +42,7 @@ interface docstrings. The tests focus on:
 """
 
 # Standard
+from unittest.mock import MagicMock
 import threading
 
 # Third Party
@@ -1410,6 +1411,61 @@ class TestGetObjectState:
         # But not writable
         assert state.available_for_write() is False
 
+        manager.close()
+
+
+# =============================================================================
+# Tests for L1Manager.clear()
+# =============================================================================
+
+
+class TestClear:
+    """Force-clear logging distinguishes safe cleanup from active locks."""
+
+    def test_force_clear_unlocked_objects_is_informational(
+        self, basic_l1_config, basic_layout, monkeypatch
+    ):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(12345)
+        manager.reserve_write([key], [False], basic_layout)
+        manager.finish_write([key])
+
+        # First Party
+        import lmcache.v1.distributed.l1_manager as l1_manager_module
+
+        warning = MagicMock()
+        info = MagicMock()
+        monkeypatch.setattr(l1_manager_module.logger, "warning", warning)
+        monkeypatch.setattr(l1_manager_module.logger, "info", info)
+
+        manager.clear(force=True)
+
+        warning.assert_not_called()
+        info.assert_any_call("L1Manager: force-clearing all %d unlocked object(s).", 1)
+        manager.close()
+
+    def test_force_clear_locked_objects_remains_warning(
+        self, basic_l1_config, basic_layout, monkeypatch
+    ):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(12345)
+        manager.reserve_write([key], [False], basic_layout)
+
+        # First Party
+        import lmcache.v1.distributed.l1_manager as l1_manager_module
+
+        warning = MagicMock()
+        monkeypatch.setattr(l1_manager_module.logger, "warning", warning)
+
+        manager.clear(force=True)
+
+        warning.assert_called_once_with(
+            "L1Manager: force-clearing all %d objects, including %d "
+            "locked object(s). This may corrupt in-flight "
+            "store/prefetch operations — use with caution.",
+            1,
+            1,
+        )
         manager.close()
 
 
